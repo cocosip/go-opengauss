@@ -1,0 +1,63 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+build/
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+coverage.out
+coverage/
+*.prof
+*.pprof
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Local build caches and generated test artifacts
+/.cache/
+/artifacts/
+/test-results/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Local credentials, TLS material and acceptance settings
+/.env
+/.env.*
+!/.env.example
+!/.env.template
+/.secrets/
+/.certs/
+/kingbase.local.json
+/kingbase-*.local.json
+
+docs/superpowers/
+.superpowers/
+
+# Vendor SDKs are local research inputs, not product source.
+/.source-code/

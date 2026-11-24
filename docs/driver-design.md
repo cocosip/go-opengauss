@@ -1,0 +1,80 @@
+# openGauss Go driver design
+
+Design baseline: 2026-11-24. An application imports one module, supplies its connection settings, and uses the same binary against multiple openGauss releases. The [feature matrix](feature-matrix.md) identifies the evidence for each version difference. The [development tracker](development-progress.md) records implementation and live acceptance separately.
+
+## Application contract
+
+| Item | Contract |
+| --- | --- |
+| Module | `github.com/cocosip/go-opengauss`, with `go 1.26.0` in go.mod and a minimum-toolchain CI job using exactly Go 1.26.0 |
+| Entry points | Package and registered driver name `opengauss`. Support a blank import with `sql.Open` and an explicit Connector with `sql.OpenDB`. |
+| Configuration | Accept libpq-style keyword/value DSNs and PostgreSQL-style URLs, positional parameters and SQLSTATE. The caller selects endpoints, TLS policy and desired role. The driver determines server capabilities. |
+| Migration | Existing standard-library callers using the opengauss name can keep their calls. The upstream package also registers mogdb. Callers of that alias must change the name. Loading both drivers under the same name would cause duplicate registration. Compare signatures for Array, CopyIn, Listener, GSS and vector helpers before promising source compatibility. |
+| Endpoints | Start with the native openGauss wire protocol. B-compatible databases, MySQL wire listeners and oGRAC have separate acceptance criteria. The oGRAC release notes list JDBC and ODBC. |
+| SQL | Pass application SQL, parameters and server errors through. Indexes, installed extensions and server syntax determine what the database can execute. |
+
+```go
+import (
+    "database/sql"
+    _ "github.com/cocosip/go-opengauss"
+)
+
+// ctx and dsn are supplied by the application.
+db, err := sql.Open("opengauss", dsn)
+if err != nil {
+    return err
+}
+defer db.Close()
+return db.PingContext(ctx)
+```
+
+## First public API
+
+The proposed initial surface is `sql.Open("opengauss", dsn)` and `opengauss.NewConnector(dsn string) (*Connector, error)` followed by `sql.OpenDB(connector)`. Both entry points use the same parser and connection state machine. Connector creation may resolve local configuration files but must not contact the database. Syntax and local configuration errors can surface at construction. Dial, TLS, authentication and session errors surface at the first operation requiring a connection, including PingContext. A connector can open multiple physical connections concurrently. Only immutable settings are shared.
+
+For the first milestone, accept `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `sslrootcert` and `connect_timeout` for a single TCP endpoint. Support keyword/value syntax and a single-host URL. Keep explicit settings authoritative. Exercise verify-full first and preserve the DNS name for certificate verification. The compatibility target for omitted sslmode is upstream's prefer. Until a requested mode or DSN option is implemented, reject it explicitly instead of silently ignoring it or selecting a weaker mode. Complete service/passfile, multi-host and the remaining F01 cases before marking F01 complete.
+
+Expose server failures as `*opengauss.Error` with `SQLState() string`, discoverable via `errors.As`. Preserve the original server code and message. Wrap local connection errors so `errors.Is` can identify context cancellation and deadline expiry. Connector.Connect must not return driver.ErrBadConn. An unsupported authentication method is a local protocol error and must not acquire an invented SQLSTATE. These API choices are project decisions to be tested through both public entry points.
+
+## Pure Go requirement
+
+All driver features, including optional authentication, encryption, COPY and codecs, must work without a C compiler, C client library or native client SDK. Implement the wire protocol in Go using net and crypto/tls. Use reviewed Go cryptographic primitives and implement the openGauss-specific message exchanges in this module. C/C++ libpq and kernel sources serve as protocol references. Do not bind them through cgo, load them dynamically, or invoke a native client executable. A feature that lacks a Go implementation stays explicitly unsupported.
+
+The upstream snapshot `1b2ca1e` provides reusable Go startup, authentication and codec code. The root driver does not link libpq. Its optional Unix Kerberos provider uses gokrb5. Its Windows provider uses SSPI for current-user credentials and its dependency loads secur32.dll through a Go syscall. Implement a Go Kerberos/SPNEGO provider for the supported credential sources on both platforms. Verify ticket acquisition and renewal against a KDC. Windows integrated logon remains a separate capability until it has a conforming implementation. Ordinary OS networking and filesystem services remain available to Go. Build and source audit results are in [F16](feature-matrix.md#pure-go-audit).
+
+Preserve applicable upstream copyrights and licenses when porting files. Review each transitive dependency, platform file and optional feature. CI must build every shipped module with cgo disabled, exercise public entry points, and inspect source and dependency changes for native loading paths that a successful build would miss.
+
+## Connection and capability selection
+
+| Stage | Behavior |
+| --- | --- |
+| Configuration | Parse once into immutable Connector settings. Resolve explicit DSN, service file, environment and defaults in descending precedence. Match passfile entries per candidate host when no explicit password is supplied. Validate paired hosts and ports. Redact credentials, keys and password-bearing DSNs in errors and logs. |
+| Transport | Use the caller's deadline across candidate nodes. Honor the configured TLS mode. Test disable, allow, prefer, require, verify-ca and verify-full, including CA, hostname and client-certificate failures. Certificate or authentication errors do not authorize weakening the caller's policy. |
+| Startup | Start with native protocol 3.51. The 1.0.0, 6.0.0 and 7.0.0 server headers all declare it. The 7.0 C client has a Lite-specific V1 branch that reconnects with 3.0 and uppercases the database name. Preserve the supplied name on ordinary connections. Enable a variant only for a documented, reproducible peer signal, on a fresh connection, within the deadline. |
+| Authentication | Dispatch on the actual AuthenticationRequest and stored-password method. Check challenge lengths and iteration fields for the selected layout. Verify a server proof when that exchange supplies one. Distinguish request 10 (SHA256), 11 (MD5-SHA256), 12 (Lite SHA256_RFC) and 13 (SM3). Return an error identifying the stage and method for an unsupported exchange. |
+| Session readiness | Consume ParameterStatus, BackendKeyData and ReadyForQuery. Preserve timezone, encoding, transaction state, endpoint and raw version strings. Parse an identifiable openGauss product version from a banner such as SELECT version(). Treat server_version as a distinct signal. The upstream parser passes its third version component by value to Sscanf. Test missing components, suffixes and unknown products. |
+| Role selection | Check recovery role separately from transaction_read_only. Enforce primary, standby, read-write and read-only when requested. any requires no role. For prefer-standby, search for an available standby before falling back to an eligible node. Upstream groups prefer-standby with any. Test primary-first address ordering. |
+| Optional features | Probe on first relevant use. Resolve type identity from namespace and pg_type, including extension or built-in vector types. Select optional catalog queries only when their dependencies are available. Basic queries must work for accounts without access to management views. |
+
+Keep capability state per physical connection as available, unavailable or unknown, together with its evidence. Missing permissions or ambiguous identity leave a capability unknown. Use an equivalent basic path when available, such as a known textual representation. Return a specific error for an unfulfilled explicit driver request. Preserve the server's original error for application SQL. Rebuild observations on reconnect or failover and refresh facts affected by session settings. Keep probes outside user transactions and in-flight results, where a failed or interleaved query could invalidate the session.
+
+## Queries, data and recovery
+
+- Support simple queries, extended Parse/Bind/Describe/Execute/Sync, prepared statements, multiple result sets, command tags, SQL NULL and empty results. Preserve RowsAffected. Use INSERT ... RETURNING for generated keys. Upstream does not provide LastInsertId. Test the official DDL, repeated prepared inserts, updates, scalar function calls, transaction and JSONB examples. [Official Go examples](https://docs.opengauss.org/zh/docs/7.0.0/developer_guide/example_common_operations_go.html)
+- Use RowDescription OID, format and typmod to select codecs. Request text for unrecognized types, preserve the original value, and avoid guessing a binary layout. Preserve numeric precision and negative scale. Test B-mode boolean text t/f and 1/0, arrays, UUID, BLOB/bytea, dates, timezones and JSONB. Return unknown column metadata when it cannot be established.
+- Start with UTF-8 client text. Distinguish database encoding, client_encoding and raw binary values. Test non-ASCII parameters and results against databases using a different server encoding. Reject unsupported client encodings explicitly. In 7.0, record A, B, C, PG and D databases separately, including the dolphin prerequisite for B. [CREATE DATABASE](https://docs.opengauss.org/zh/docs/7.0.0/sql_reference/create_database.html)
+- Implement DriverContext, Connector, QueryerContext, ExecerContext, ConnPrepareContext, ConnBeginTx, Pinger and appropriate rows interfaces. Validator and SessionResetter must account for transaction and protocol state. Preserve SQLSTATE, severity and details with errors.As. Return driver.ErrBadConn only when permitted by the Go contract and execution can be ruled out. A lost COMMIT response has an unknown outcome. Never replay that transaction. [Go 1.26.0 driver interfaces](https://github.com/golang/go/blob/go1.26.0/src/database/sql/driver/driver.go)
+- Send cancellation only to the original backend endpoint with that connection's key. Coordinate late cancellation with row completion and pool return. Discard the connection if synchronization cannot be confirmed. A transaction remains bound to one physical connection.
+
+## Operations tied to a session
+
+| Operation | Implementation and acceptance |
+| --- | --- |
+| COPY | Pin the connection through completion and ReadyForQuery. Stream text FROM STDIN first. Check constraints, early cancellation, transaction state and final row count. A separate session can observe pg_stat_progress_copy on 7.0. bytes_total applies only to FROM FILE. Track TO STDOUT and binary input/output independently as proposed extensions. |
+| Notifications | Use a dedicated LISTEN connection. Registration and delivery take effect at commit. Test UNLISTEN, rollback and two sessions in the same database. Re-register on reconnect and signal the delivery gap. The 7.0 documentation excludes thread-pool mode. [LISTEN](https://docs.opengauss.org/zh/docs/7.0.0/sql_reference/listen.html) |
+| Vector search | Bind and round-trip text before enabling a specialized codec for an identified format. The optional concurrent helper accepts context, reuses the caller's pool, bounds concurrency, preserves input order and returns per-item errors. Keep validated scan settings and query execution on one pinned session, restore session settings and release the connection on error. |
+| HA and upgrades | Select the endpoint when opening a physical connection. Preserve candidate-specific errors and the caller's deadline. Test mixed versions and re-detection after switchover. Record actual GUCs on fresh and upgraded installations. Routing does not move a running transaction. |
+
+## Release evidence
+
+Run one driver binary against each target build. Start with 7.0.0 LTS, 6.0.6, 6.0.0 and 5.0.x, then cover the historical and RC lines. Record edition, compatibility mode, plugins, native port, topology, TLS and thread-pool settings. Publish support only for measured build/feature combinations. Future releases use the basic protocol path and acquire specific rules when official changes and reproducible server behavior justify them.
