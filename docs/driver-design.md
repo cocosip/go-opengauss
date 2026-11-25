@@ -10,7 +10,7 @@ Design baseline: 2026-11-24. An application imports one module, supplies its con
 | Entry points | Package and registered driver name `opengauss`. Support a blank import with `sql.Open` and an explicit Connector with `sql.OpenDB`. |
 | Configuration | Accept libpq-style keyword/value DSNs and PostgreSQL-style URLs, positional parameters and SQLSTATE. The caller selects endpoints, TLS policy and desired role. The driver determines server capabilities. |
 | Migration | Existing standard-library callers using the opengauss name can keep their calls. The upstream package also registers mogdb. Callers of that alias must change the name. Loading both drivers under the same name would cause duplicate registration. Compare signatures for Array, CopyIn, Listener, GSS and vector helpers before promising source compatibility. |
-| Endpoints | Start with the native openGauss wire protocol. B-compatible databases, MySQL wire listeners and oGRAC have separate acceptance criteria. The oGRAC release notes list JDBC and ODBC. |
+| Endpoints | Start with the native openGauss wire protocol. B-compatible databases, MySQL wire listeners and oGRAC have separate acceptance criteria. The oGRAC release notes list JDBC and ODBC, and its architecture page also lists the oGRAC C driver. The F13 investigation and its decisions are recorded in [protocol-research.md](protocol-research.md). |
 | SQL | Pass application SQL, parameters and server errors through. Indexes, installed extensions and server syntax determine what the database can execute. |
 
 ```go
