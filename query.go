@@ -221,16 +221,21 @@ func encodeTextValue(value driver.Value) ([]byte, error) {
 	case string:
 		return []byte(v), nil
 	case []byte:
+		// Parameters are text in the server's client encoding, so bytes are
+		// passed through untouched. A bytea value must already be written as
+		// "\x" plus hex digits or in the legacy escape form.
 		return v, nil
 	case int64:
 		return strconv.AppendInt(nil, v, 10), nil
 	case float64:
 		return strconv.AppendFloat(nil, v, 'f', -1, 64), nil
 	case bool:
+		// 1/0 is accepted by the native and the dolphin-compatible B mode
+		// parsers, while "true" is not portable to B mode.
 		if v {
-			return []byte("true"), nil
+			return []byte("1"), nil
 		}
-		return []byte("false"), nil
+		return []byte("0"), nil
 	case time.Time:
 		return []byte(v.Format("2006-01-02 15:04:05.999999999-07:00")), nil
 	default:

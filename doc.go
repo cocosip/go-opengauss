@@ -12,4 +12,26 @@
 //
 // Applications that need to resolve configuration before the first connection
 // can build a Connector with NewConnector and hand it to sql.OpenDB.
+//
+// # Values
+//
+// Parameters and results use the server's text representation. A parameter is
+// converted to text as follows: string and []byte pass through unchanged, int64
+// and float64 use their decimal form, bool becomes 1 or 0, time.Time uses an
+// ISO timestamp with its zone offset, and nil is SQL NULL. A []byte parameter
+// therefore carries text, not a binary value: send a bytea column as []byte
+// holding "\x" followed by hex digits, or as a string in the legacy escape
+// form.
+//
+// Results are decoded by the type OID reported for each column: bool becomes
+// bool, int2/int4/int8/oid become int64, float4/float8 become float64 (NaN and
+// Infinity included), bytea becomes []byte, and date/timestamp/timestamptz
+// become time.Time. Every other type, including numeric, JSON, UUID, intervals,
+// arrays, enums, domains and unknown OIDs, is returned as the exact server text
+// so precision and representation are preserved. A value whose text is not in
+// the expected shape, such as infinity, a BC date or an undecodable bytea
+// escape, is also returned as text rather than guessed.
+//
+// ColumnTypes reports the database type name and the Go scan type that this
+// mapping produces for each column.
 package opengauss

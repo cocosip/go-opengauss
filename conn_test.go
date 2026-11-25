@@ -1,6 +1,7 @@
 package opengauss
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -20,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1209,6 +1211,189 @@ func newSilentServer(t *testing.T) int {
 		wg.Wait()
 	})
 	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func TestTypedResultValues(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		query := s.expectSimpleQuery()
+		if query != "SELECT types" {
+			s.fail("query = %q", query)
+		}
+		s.sendRowDescription(
+			fakeColumn{name: "b", oid: 16},
+			fakeColumn{name: "i8", oid: 20},
+			fakeColumn{name: "f8", oid: 701},
+			fakeColumn{name: "raw", oid: 17},
+			fakeColumn{name: "ts", oid: 1114},
+			fakeColumn{name: "tstz", oid: 1184},
+			fakeColumn{name: "amount", oid: 1700},
+			fakeColumn{name: "missing", oid: 25},
+			fakeColumn{name: "other", oid: 999999},
+		)
+		s.sendDataRow("t", "-9007199254740993", "2.5", `\x0001ff`,
+			"2026-01-02 15:04:05.5", "2026-01-02 15:04:05.5+08",
+			"12345678901234567890.12", nil, "opaque")
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	result, err := db.QueryContext(testContext(t), "SELECT types")
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = result.Close() }()
+
+	types, err := result.ColumnTypes()
+	if err != nil {
+		t.Fatalf("ColumnTypes: %v", err)
+	}
+	wantNames := []string{"bool", "int8", "float8", "bytea", "timestamp", "timestamptz", "numeric", "text", ""}
+	wantScan := []reflect.Type{
+		reflect.TypeOf(false), reflect.TypeOf(int64(0)), reflect.TypeOf(float64(0)),
+		reflect.TypeOf([]byte(nil)), reflect.TypeOf(time.Time{}), reflect.TypeOf(time.Time{}),
+		reflect.TypeOf(""), reflect.TypeOf(""), reflect.TypeOf(""),
+	}
+	if len(types) != len(wantNames) {
+		t.Fatalf("ColumnTypes = %d columns, want %d", len(types), len(wantNames))
+	}
+	for i, columnType := range types {
+		if got := columnType.DatabaseTypeName(); got != wantNames[i] {
+			t.Errorf("DatabaseTypeName(%d) = %q, want %q", i, got, wantNames[i])
+		}
+		if got := columnType.ScanType(); got != wantScan[i] {
+			t.Errorf("ScanType(%d) = %v, want %v", i, got, wantScan[i])
+		}
+	}
+
+	if !result.Next() {
+		t.Fatalf("Next: %v", result.Err())
+	}
+	var (
+		b        bool
+		i8       int64
+		f8       float64
+		raw      []byte
+		ts, tstz time.Time
+		amount   string
+		missing  sql.NullString
+		other    string
+	)
+	if err := result.Scan(&b, &i8, &f8, &raw, &ts, &tstz, &amount, &missing, &other); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !b {
+		t.Error("bool = false, want true")
+	}
+	if i8 != -9007199254740993 {
+		t.Errorf("int8 = %d, want -9007199254740993", i8)
+	}
+	if f8 != 2.5 {
+		t.Errorf("float8 = %v, want 2.5", f8)
+	}
+	if !bytes.Equal(raw, []byte{0x00, 0x01, 0xff}) {
+		t.Errorf("bytea = %v, want 00 01 ff", raw)
+	}
+	wantTS := time.Date(2026, 1, 2, 15, 4, 5, 500000000, time.UTC)
+	if !ts.Equal(wantTS) {
+		t.Errorf("timestamp = %v, want %v", ts, wantTS)
+	}
+	if wantInstant := time.Date(2026, 1, 2, 7, 4, 5, 500000000, time.UTC); !tstz.Equal(wantInstant) {
+		t.Errorf("timestamptz = %v, want the instant %v", tstz, wantInstant)
+	}
+	if hour, _, _ := tstz.Clock(); hour != 15 {
+		t.Errorf("timestamptz hour = %d, want the wall clock of the +08 value", hour)
+	}
+	if _, offset := tstz.Zone(); offset != 8*3600 {
+		t.Errorf("timestamptz offset = %d, want 28800", offset)
+	}
+	if amount != "12345678901234567890.12" {
+		t.Errorf("numeric = %q, want the exact text", amount)
+	}
+	if missing.Valid {
+		t.Errorf("NULL column scanned as %q, want invalid", missing.String)
+	}
+	if other != "opaque" {
+		t.Errorf("unknown OID = %q, want the text", other)
+	}
+	if result.Next() {
+		t.Error("a second row was returned")
+	}
+}
+
+func TestByteaParameterIsText(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		query, args := s.expectExtended()
+		if query != "SELECT $1::bytea" {
+			s.fail("query = %q", query)
+		}
+		// []byte carries text, so a bytea value must already be in the
+		// server's text representation and is sent untouched.
+		if len(args) != 1 || args[0].text != `\x0001ff` {
+			s.fail("bound parameters = %+v, want the bytea text unchanged", args)
+		}
+		s.sendParseComplete()
+		s.sendBindComplete()
+		s.sendRowDescription(fakeColumn{name: "raw", oid: 17})
+		s.sendDataRow(`\x0001ff`)
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	var got []byte
+	if err := db.QueryRowContext(testContext(t), "SELECT $1::bytea", []byte(`\x0001ff`)).Scan(&got); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !bytes.Equal(got, []byte{0x00, 0x01, 0xff}) {
+		t.Errorf("bytea = %v, want 00 01 ff", got)
+	}
+}
+
+func TestBooleanParameterUsesOneAndZero(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seen []string
+	)
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		query, args := s.expectExtended()
+		if query != "SELECT $1::boolean, $2::boolean" {
+			s.fail("query = %q", query)
+		}
+		texts := make([]string, 0, len(args))
+		for _, arg := range args {
+			texts = append(texts, arg.text)
+		}
+		mu.Lock()
+		seen = texts
+		mu.Unlock()
+		s.sendParseComplete()
+		s.sendBindComplete()
+		s.sendRowDescription(fakeColumn{name: "a", oid: 16}, fakeColumn{name: "b", oid: 16})
+		s.sendDataRow("1", "0")
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	var first, second bool
+	if err := db.QueryRowContext(testContext(t), "SELECT $1::boolean, $2::boolean", true, false).Scan(&first, &second); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), seen...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "1" || got[1] != "0" {
+		t.Errorf("bound booleans = %v, want 1 and 0", got)
+	}
+	if !first || second {
+		t.Errorf("scanned booleans = %v/%v, want true/false", first, second)
+	}
 }
 
 // closedPort returns a local port with no listener.

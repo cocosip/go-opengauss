@@ -4,13 +4,23 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
-	"github.com/cocosip/go-opengauss/internal/proto"
 	"io"
+	"reflect"
+
+	"github.com/cocosip/go-opengauss/internal/oid"
+	"github.com/cocosip/go-opengauss/internal/proto"
 )
+
+// column is one result column: the name database/sql exposes and the type OID
+// that selects the Go value produced for its text representation.
+type column struct {
+	name string
+	oid  int32
+}
 
 type rows struct {
 	conn    *conn
-	columns []string
+	columns []column
 	ctx     context.Context
 	watcher *cancelWatcher
 	done    bool
@@ -18,8 +28,26 @@ type rows struct {
 
 func (r *rows) Columns() []string {
 	names := make([]string, len(r.columns))
-	copy(names, r.columns)
+	for i, column := range r.columns {
+		names[i] = column.name
+	}
 	return names
+}
+
+// ColumnTypeDatabaseTypeName implements driver.RowsColumnTypeDatabaseTypeName.
+func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
+	if index < 0 || index >= len(r.columns) {
+		return ""
+	}
+	return oid.TypeName(r.columns[index].oid)
+}
+
+// ColumnTypeScanType implements driver.RowsColumnTypeScanType.
+func (r *rows) ColumnTypeScanType(index int) reflect.Type {
+	if index < 0 || index >= len(r.columns) {
+		return reflect.TypeOf("")
+	}
+	return oid.ScanType(r.columns[index].oid)
 }
 
 // finish ends the operation scope opened for this result, clearing the socket
@@ -130,7 +158,7 @@ func (r *rows) scanRow(body []byte, dest []driver.Value) error {
 			dest[i] = nil
 			continue
 		}
-		dest[i] = rb.Bytes(int(length))
+		dest[i] = oid.Decode(r.columns[i].oid, rb.Bytes(int(length)))
 		if rb.Err != nil {
 			break
 		}
@@ -142,10 +170,9 @@ func (r *rows) scanRow(body []byte, dest []driver.Value) error {
 	return nil
 }
 
-// parseRowDescription returns the column names. The remaining RowDescription
-// fields describe types and formats that the text-only first milestone does not
-// use; they are consumed here so the cursor stays aligned.
-func parseRowDescription(body []byte) ([]string, error) {
+// parseRowDescription returns the column names and type OIDs. The remaining
+// RowDescription fields are consumed so the cursor stays aligned.
+func parseRowDescription(body []byte) ([]column, error) {
 	r := &proto.ReadBuf{B: body}
 	count := int(r.Int16())
 	// A negative count means the 16-bit field exceeded math.MaxInt16, and a
@@ -153,21 +180,27 @@ func parseRowDescription(body []byte) ([]string, error) {
 	if r.Err != nil || count < 0 || count > r.Remaining() {
 		return nil, proto.ErrMalformedMessage
 	}
-	names := make([]string, 0, count)
+	columns := make([]column, 0, count)
 	for i := 0; i < count; i++ {
-		names = append(names, r.String())
+		name := r.String()
 		r.Int32() // table OID
 		r.Int16() // attribute number
-		r.Int32() // data type OID
+		typeOID := r.Int32()
 		r.Int16() // data type size
 		r.Int32() // type modifier
-		r.Int16() // format code
+		format := r.Int16()
 		if r.Err != nil {
 			return nil, proto.ErrMalformedMessage
 		}
+		// The driver always requests text results. A binary column would be
+		// decoded as text and silently produce wrong values, so refuse it.
+		if format != 0 {
+			return nil, fmt.Errorf("opengauss: result column %q uses binary format, which this driver does not request", name)
+		}
+		columns = append(columns, column{name: name, oid: typeOID})
 	}
 	if r.Err != nil {
 		return nil, proto.ErrMalformedMessage
 	}
-	return names, nil
+	return columns, nil
 }
