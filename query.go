@@ -19,8 +19,11 @@ func (c *conn) ExecContext(ctx context.Context, statement string, args []driver.
 	if err := validateQuery(statement); err != nil {
 		return nil, err
 	}
-	if isCopyFromStdin(statement) {
+	switch kind, _ := copyDirection(statement); kind {
+	case copyIn:
 		return nil, errCopyInRequired
+	case copyOut:
+		return nil, errCopyOutRequired
 	}
 	frames, err := queryFrames(statement, args)
 	if err != nil {
@@ -38,8 +41,18 @@ func (c *conn) QueryContext(ctx context.Context, statement string, args []driver
 	if err := validateQuery(statement); err != nil {
 		return nil, err
 	}
-	if isCopyFromStdin(statement) {
+	kind, clauseEnd := copyDirection(statement)
+	switch kind {
+	case copyIn:
 		return nil, errCopyInRequired
+	case copyOut:
+		if len(args) > 0 {
+			return nil, errCopyOutParameters
+		}
+		if err := copyOutTailError(statement, clauseEnd); err != nil {
+			return nil, err
+		}
+		return c.queryCopyOut(ctx, statement)
 	}
 	frames, err := queryFrames(statement, args)
 	if err != nil {
@@ -346,7 +359,8 @@ func (c *conn) drainUntilReady() error {
 			return nil
 		case proto.MsgErrorResponse, proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus,
 			proto.MsgCommandComplete, proto.MsgDataRow, proto.MsgRowDescription, proto.MsgEmptyQueryResponse,
-			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgNoData, proto.MsgParameterDescription, proto.MsgCloseComplete:
+			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgNoData, proto.MsgParameterDescription, proto.MsgCloseComplete,
+			proto.MsgCopyData, proto.MsgCopyDone:
 			// Discarded while resynchronizing.
 		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
 			c.bad = true

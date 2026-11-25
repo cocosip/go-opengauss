@@ -614,6 +614,31 @@ func (s *fakeSession) sendCopyInResponse(format byte, columns int) {
 	s.writeRaw(m.Finish())
 }
 
+// sendCopyOutResponse announces the row width of a COPY ... TO STDOUT stream.
+// The overall format selects text or binary; the columns are announced as text
+// because the driver never asks the server for binary output.
+func (s *fakeSession) sendCopyOutResponse(format byte, columns int) {
+	m := proto.NewMessageWriter(proto.MsgCopyOutResponse)
+	m.Byte(format)
+	m.Int16(int16(columns))
+	for i := 0; i < columns; i++ {
+		m.Int16(0)
+	}
+	s.writeRaw(m.Finish())
+}
+
+// sendCopyData sends one CopyData chunk of a COPY ... TO STDOUT stream.
+func (s *fakeSession) sendCopyData(payload string) {
+	m := proto.NewMessageWriter(proto.MsgCopyData)
+	m.Bytes([]byte(payload))
+	s.writeRaw(m.Finish())
+}
+
+// sendCopyDone ends the server side of a COPY ... TO STDOUT stream.
+func (s *fakeSession) sendCopyDone() {
+	s.writeRaw(proto.NewMessageWriter(proto.MsgCopyDone).Finish())
+}
+
 // readCopyRows collects the CopyData payloads of one stream until CopyDone.
 func (s *fakeSession) readCopyRows() []string {
 	var rows []string

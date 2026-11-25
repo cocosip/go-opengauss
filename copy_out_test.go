@@ -1,0 +1,709 @@
+package opengauss
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/cocosip/go-opengauss/internal/proto"
+)
+
+func TestCopyOutStreamsRowsAcrossFrames(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if got := s.expectSimpleQuery(); got != query {
+			s.fail("query = %q, want %q", got, query)
+			return
+		}
+		s.sendCopyOutResponse(0, 3)
+		// The second row is split in the middle of a field and the third
+		// field of the second row is NULL.
+		s.sendCopyData("1\tplain\t\\N\n2\tta")
+		// Asynchronous messages may arrive between CopyData frames.
+		s.sendNotice("copy in progress")
+		s.sendParameterStatus("application_name", "copy out test")
+		s.sendCopyData("b\\tc\t\\N\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 2")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("Columns: %v", err)
+	}
+	if want := []string{"column1", "column2", "column3"}; !reflect.DeepEqual(columns, want) {
+		t.Fatalf("columns = %v, want %v", columns, want)
+	}
+	var got [][]any
+	for rows.Next() {
+		var a, b, c any
+		if err := rows.Scan(&a, &b, &c); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got = append(got, []any{a, b, c})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	want := [][]any{{"1", "plain", nil}, {"2", "tab\tc", nil}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows = %#v, want %#v", got, want)
+	}
+	// The session must be reusable after the stream reached ReadyForQuery.
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+	if server.connections() != 1 {
+		t.Errorf("connections = %d, want the same session reused", server.connections())
+	}
+}
+
+func TestCopyOutDecodesTextEscapes(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 1)
+		s.sendCopyData(`a\tb\nc\\d\101\x42\q` + "\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 1")
+		s.sendReady(proto.TxnIdle)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	rows, err := db.QueryContext(testContext(t), query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		t.Fatalf("Next = false, err = %v", rows.Err())
+	}
+	var value string
+	if err := rows.Scan(&value); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if want := "a\tb\nc\\dABq"; value != want {
+		t.Fatalf("value = %q, want %q", value, want)
+	}
+	if rows.Next() {
+		t.Fatal("an extra row was returned")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+}
+
+func TestCopyOutEarlyCloseDiscardsRemainingRows(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 2)
+		s.sendCopyData("1\tfirst\n2\tsecond\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 2")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("Next = false, err = %v", rows.Err())
+	}
+	var id, name string
+	if err := rows.Scan(&id, &name); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if id != "1" || name != "first" {
+		t.Fatalf("row = %q %q", id, name)
+	}
+	// The frontend cannot end a copy-out stream, so Close discards the rest.
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+	if server.connections() != 1 {
+		t.Errorf("connections = %d, want the stream drained on the same session", server.connections())
+	}
+}
+
+func TestCopyOutRejectsBinaryFormat(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	var server *fakeServer
+	server = newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(1, 2)
+		// Copy-out cannot be ended from the frontend, so the driver cancels
+		// the stream it cannot decode.
+		select {
+		case <-server.cancels:
+		case <-time.After(5 * time.Second):
+			s.fail("no cancel request arrived")
+			return
+		}
+		s.sendError("57014", "canceling statement due to user request")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	_, err := db.QueryContext(ctx, query)
+	if err == nil || !strings.Contains(err.Error(), "binary format") {
+		t.Fatalf("QueryContext = %v, want a binary-format refusal", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+func TestCopyOutRejectsParametersAndExec(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	if _, err := db.QueryContext(ctx, "COPY demotable TO STDOUT", 1); err == nil ||
+		!strings.Contains(err.Error(), "does not accept parameters") {
+		t.Fatalf("QueryContext with parameters = %v, want a refusal", err)
+	}
+	if _, err := db.ExecContext(ctx, "COPY demotable TO STDOUT"); err == nil ||
+		!strings.Contains(err.Error(), "must be read with QueryContext") {
+		t.Fatalf("ExecContext = %v, want a refusal", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+func TestCopyOutServerErrorBeforeStream(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendError("42501", "permission denied for table demotable")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	_, err := db.QueryContext(ctx, query)
+	var serverErr *Error
+	if !errors.As(err, &serverErr) || serverErr.Code != "42501" {
+		t.Fatalf("QueryContext = %v, want SQLSTATE 42501", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+func TestCopyOutPrepareIsRejected(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	_, err := db.PrepareContext(ctx, "COPY demotable TO STDOUT")
+	if err == nil || !strings.Contains(err.Error(), "must be read with QueryContext") {
+		t.Fatalf("PrepareContext = %v, want a refusal", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+func TestCopyOutCloseBeforeFirstRow(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 1)
+		s.sendCopyData("1\n2\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 2")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+func TestCopyOutToleratesEmptyTrailingStatement(t *testing.T) {
+	const query = "COPY demotable TO STDOUT;"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 1)
+		s.sendCopyData("1\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 1")
+		// A server that reports the empty trailing statement must not turn a
+		// completed stream into an error.
+		s.writeRaw(proto.NewMessageWriter(proto.MsgEmptyQueryResponse).Finish())
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		t.Fatalf("Next = false, err = %v", rows.Err())
+	}
+	if rows.Next() {
+		t.Fatal("an extra row was returned")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+func TestCopyOutMidStreamErrorReturnsServerError(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 1)
+		s.sendCopyData("1\n")
+		s.sendError("22P02", "invalid input syntax")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		t.Fatalf("Next = false, err = %v", rows.Err())
+	}
+	if rows.Next() {
+		t.Fatal("an extra row was returned")
+	}
+	var serverErr *Error
+	if err := rows.Err(); !errors.As(err, &serverErr) || serverErr.Code != "22P02" {
+		t.Fatalf("Rows.Err = %v, want SQLSTATE 22P02", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+func TestCopyOutTruncatedFinalRow(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 1)
+		s.sendCopyData("1\npartial")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 1")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		t.Fatalf("Next = false, err = %v", rows.Err())
+	}
+	if rows.Next() {
+		t.Fatal("a truncated row was accepted")
+	}
+	if err := rows.Err(); err == nil || !strings.Contains(err.Error(), "middle of a row") {
+		t.Fatalf("Rows.Err = %v, want a truncated-row error", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+func TestCopyOutRowCapAllowsMultiRowFrames(t *testing.T) {
+	restore := setMaxCopyOutRow(16)
+	defer restore()
+
+	const query = "COPY demotable TO STDOUT"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 1)
+		// Nine one-byte rows share one frame, so the frame is larger than the
+		// row cap while every row is far below it.
+		s.sendCopyData("1\n2\n3\n4\n5\n6\n7\n8\n9\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 9")
+		s.sendReady(proto.TxnIdle)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	rows, err := db.QueryContext(testContext(t), query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	if count != 9 {
+		t.Fatalf("rows = %d, want 9", count)
+	}
+}
+
+func TestCopyOutRowCapStopsStream(t *testing.T) {
+	restore := setMaxCopyOutRow(16)
+	defer restore()
+
+	const query = "COPY demotable TO STDOUT"
+	var server *fakeServer
+	server = newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 1)
+		s.sendCopyData(strings.Repeat("x", 20))
+		// The driver stops the stream it cannot decode.
+		select {
+		case <-server.cancels:
+		case <-time.After(5 * time.Second):
+			s.fail("no cancel request arrived")
+			return
+		}
+		s.sendError("57014", "canceling statement due to user request")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		t.Fatal("an oversized row was accepted")
+	}
+	if err := rows.Err(); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("Rows.Err = %v, want an oversized-row error", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+	if server.connections() != 1 {
+		t.Errorf("connections = %d, want the confirmed cancel to keep the session", server.connections())
+	}
+}
+
+func TestCopyOutUnconfirmedCancelDiscardsSession(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	var server *fakeServer
+	var connections atomic.Int32
+	server = newFakeServerWithCancelHold(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if connections.Add(1) == 1 {
+			s.expectSimpleQuery()
+			s.sendCopyOutResponse(1, 1)
+			select {
+			case <-server.cancels:
+			case <-time.After(5 * time.Second):
+				s.fail("no cancel request arrived")
+				return
+			}
+			s.sendError("57014", "canceling statement due to user request")
+			s.sendReady(proto.TxnIdle)
+			return
+		}
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	}, 1500*time.Millisecond)
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	_, err := db.QueryContext(ctx, query)
+	if err == nil || !strings.Contains(err.Error(), "binary format") {
+		t.Fatalf("QueryContext = %v, want a binary-format refusal", err)
+	}
+	// The cancel was not confirmed before the grace period, so the session
+	// must not be handed to another statement.
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+	if connections.Load() != 2 {
+		t.Errorf("connections = %d, want the unconfirmed cancel to discard the session", connections.Load())
+	}
+}
+
+// setMaxCopyOutRow lowers the row cap for one test and returns the restore
+// function. The package tests do not run in parallel, so a global is safe here.
+func setMaxCopyOutRow(limit int) func() {
+	previous := maxCopyOutRow
+	maxCopyOutRow = limit
+	return func() { maxCopyOutRow = previous }
+}
+
+func TestCopyOutWrongFieldCountStopsStream(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 3)
+		s.sendCopyData("1\t2\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 0")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		t.Fatal("a malformed row was accepted")
+	}
+	if err := rows.Err(); err == nil || !strings.Contains(err.Error(), "2 fields") {
+		t.Fatalf("Rows.Err = %v, want a field-count error", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+func TestCopyOutCancelledStreamKeepsSessionSynchronized(t *testing.T) {
+	const query = "COPY demotable TO STDOUT"
+	var server *fakeServer
+	var connections atomic.Int32
+	queryStarted := make(chan struct{})
+	server = newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if connections.Add(1) == 1 {
+			s.expectSimpleQuery()
+			s.sendCopyOutResponse(0, 1)
+			s.sendCopyData("1\n")
+			close(queryStarted)
+			select {
+			case <-server.cancels:
+			case <-time.After(5 * time.Second):
+				s.fail("no cancel request arrived")
+				return
+			}
+			s.sendError("57014", "canceling statement due to user request")
+			s.sendReady(proto.TxnIdle)
+			s.expectPing()
+			s.expectType(proto.MsgTerminate)
+			return
+		}
+		s.fail("the cancelled COPY OUT session was not reused")
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-queryStarted
+		cancel()
+	}()
+
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+	}
+	if err := rows.Err(); err == nil {
+		t.Fatal("the cancelled stream reported no error")
+	} else if !errors.Is(err, context.Canceled) {
+		var serverErr *Error
+		if !errors.As(err, &serverErr) || serverErr.Code != "57014" {
+			t.Fatalf("Rows.Err = %v, want the cancellation", err)
+		}
+	}
+	if err := db.PingContext(testContext(t)); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+	if connections.Load() != 1 {
+		t.Errorf("connections = %d, want the resynchronized session reused", connections.Load())
+	}
+}
+
+func TestCopyOutStreamsManyRows(t *testing.T) {
+	const (
+		query = "COPY demotable TO STDOUT"
+		total = 500
+	)
+	var payload strings.Builder
+	for i := 0; i < total; i++ {
+		fmt.Fprintf(&payload, "%d\tvalue-%d\n", i, i)
+	}
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 2)
+		// Chunks of seven bytes cut rows and fields at arbitrary points.
+		chunk := payload.String()
+		for len(chunk) > 0 {
+			size := 7
+			if size > len(chunk) {
+				size = len(chunk)
+			}
+			s.sendCopyData(chunk[:size])
+			chunk = chunk[size:]
+		}
+		s.sendCopyDone()
+		s.sendCommandComplete(fmt.Sprintf("COPY %d", total))
+		s.sendReady(proto.TxnIdle)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	rows, err := db.QueryContext(testContext(t), query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	count := 0
+	for rows.Next() {
+		var id, value string
+		if err := rows.Scan(&id, &value); err != nil {
+			t.Fatalf("Scan row %d: %v", count, err)
+		}
+		if wantID := fmt.Sprintf("%d", count); id != wantID {
+			t.Fatalf("row %d id = %q, want %q", count, id, wantID)
+		}
+		if wantValue := fmt.Sprintf("value-%d", count); value != wantValue {
+			t.Fatalf("row %d value = %q, want %q", count, value, wantValue)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	if count != total {
+		t.Fatalf("rows = %d, want %d", count, total)
+	}
+}
+
+func TestDecodeCopyField(t *testing.T) {
+	tests := []struct {
+		field string
+		want  string
+	}{
+		{"plain", "plain"},
+		{`tab\there`, "tab\there"},
+		{`newline\nhere`, "newline\nhere"},
+		{`carriage\rhere`, "carriage\rhere"},
+		{`backspace\bhere`, "backspace\bhere"},
+		{`formfeed\fhere`, "formfeed\fhere"},
+		{`vertical\vhere`, "vertical\vhere"},
+		{`back\\slash`, `back\slash`},
+		{`octal\101`, "octalA"},
+		{`hex\x42`, "hexB"},
+		{`unknown\qescape`, "unknownqescape"},
+		{`trailing\`, `trailing\`},
+		{`\\N`, `\N`},
+	}
+	for _, tc := range tests {
+		if got := string(decodeCopyField([]byte(tc.field))); got != tc.want {
+			t.Errorf("decodeCopyField(%q) = %q, want %q", tc.field, got, tc.want)
+		}
+	}
+}
+
+func TestCopyOutTailError(t *testing.T) {
+	withOptions := "COPY demotable TO STDOUT WITH (FORMAT csv)"
+	if kind, clauseEnd := copyDirection(withOptions); kind != copyOut {
+		t.Fatalf("copyDirection = %v, want copyOut", kind)
+	} else if err := copyOutTailError(withOptions, clauseEnd); err == nil {
+		t.Fatal("a CSV option was accepted")
+	}
+	plain := "COPY (SELECT 'TO STDOUT') TO STDOUT"
+	if kind, clauseEnd := copyDirection(plain); kind != copyOut {
+		t.Fatalf("copyDirection = %v, want copyOut", kind)
+	} else if err := copyOutTailError(plain, clauseEnd); err != nil {
+		t.Fatalf("a default-format statement was rejected: %v", err)
+	}
+	commented := "COPY demotable TO/**/STDOUT -- note\n"
+	if kind, clauseEnd := copyDirection(commented); kind != copyOut {
+		t.Fatalf("copyDirection = %v, want copyOut", kind)
+	} else if err := copyOutTailError(commented, clauseEnd); err != nil {
+		t.Fatalf("a trailing comment was rejected: %v", err)
+	}
+}

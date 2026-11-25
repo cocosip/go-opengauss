@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -247,5 +248,84 @@ func TestLiveMultiVectorSearch(t *testing.T) {
 		if !ok || id != want {
 			t.Errorf("result %d nearest id = %v, want %d", i, results[i].Rows[0]["id"], want)
 		}
+	}
+}
+
+// TestLiveCopyOut reads a COPY ... TO STDOUT stream from a real server: a NULL
+// field, a tab inside a value and an early close that must leave the session
+// usable for the next statement.
+func TestLiveCopyOut(t *testing.T) {
+	dsn := os.Getenv("OPENGAUSS_DSN")
+	if dsn == "" {
+		t.Skip("set OPENGAUSS_DSN to run against a live openGauss server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	defer func() { _ = db.Close() }()
+
+	table := fmt.Sprintf("opengauss_live_copy_out_%d", os.Getpid())
+	if _, err := db.ExecContext(ctx, "CREATE TABLE "+table+" (id integer, label text)"); err != nil {
+		t.Skipf("cannot create a table: %v", err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+table)
+	}()
+	if _, err := db.ExecContext(ctx, "INSERT INTO "+table+" (id, label) VALUES (1, 'one'), (2, NULL), (3, 'tab\there')"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	rows, err := db.QueryContext(ctx, "COPY "+table+" TO STDOUT")
+	if err != nil {
+		t.Fatalf("COPY TO STDOUT: %v", err)
+	}
+	type record struct {
+		id    string
+		label any
+	}
+	var got []record
+	for rows.Next() {
+		var id string
+		var label any
+		if err := rows.Scan(&id, &label); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got = append(got, record{id: id, label: label})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	want := []record{{id: "1", label: "one"}, {id: "2", label: nil}, {id: "3", label: "tab\there"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows = %#v, want %#v", got, want)
+	}
+
+	// A caller that stops early must leave the session synchronized.
+	rows, err = db.QueryContext(ctx, "COPY "+table+" TO STDOUT")
+	if err != nil {
+		t.Fatalf("second COPY TO STDOUT: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("second stream returned no row: %v", rows.Err())
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close after one row: %v", err)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil {
+		t.Fatalf("query after early close: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("count = %d, want 3", count)
 	}
 }

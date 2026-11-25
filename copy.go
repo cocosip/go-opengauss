@@ -84,17 +84,156 @@ func quoteIdentifier(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
-// isCopyFromStdin reports whether statement streams data, which the driver
-// handles with the simple query protocol instead of a server-side prepare.
-func isCopyFromStdin(statement string) bool {
-	trimmed := strings.TrimSpace(statement)
-	if len(trimmed) < len("copy") || !strings.EqualFold(trimmed[:len("copy")], "copy") {
-		return false
+// copyKind is the data direction of a COPY statement.
+type copyKind int
+
+const (
+	copyNone copyKind = iota
+	copyIn
+	copyOut
+)
+
+// copyDirection reports the direction of a COPY statement and the offset just
+// after the direction clause. The clause must be outside parentheses, so a
+// subquery cannot select the wrong path, and keywords inside string literals
+// (including dollar-quoted ones), quoted identifiers and comments are ignored.
+func copyDirection(statement string) (copyKind, int) {
+	i := skipLeadingComments(statement)
+	const keyword = "COPY"
+	if len(statement)-i < len(keyword) || !strings.EqualFold(statement[i:i+len(keyword)], keyword) {
+		return copyNone, 0
 	}
-	return strings.Contains(strings.ToUpper(trimmed), " FROM STDIN")
+	i += len(keyword)
+	if i < len(statement) && isIdentifierByte(statement[i]) {
+		return copyNone, 0
+	}
+	depth := 0
+	for i < len(statement) {
+		switch c := statement[i]; {
+		case c == '\'':
+			i = skipQuoted(statement, i, '\'')
+		case c == '"':
+			i = skipQuoted(statement, i, '"')
+		case c == '$':
+			if end := skipDollarQuoted(statement, i); end > i {
+				i = end
+				continue
+			}
+			i++
+		case c == '-' && i+1 < len(statement) && statement[i+1] == '-':
+			for i < len(statement) && statement[i] != '\n' && statement[i] != '\r' {
+				i++
+			}
+		case c == '/' && i+1 < len(statement) && statement[i+1] == '*':
+			i = skipBlockComment(statement, i+2)
+		case c == '(':
+			depth++
+			i++
+		case c == ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+		default:
+			if depth == 0 {
+				if end, ok := matchKeyword(statement, i, "FROM"); ok {
+					if end, ok = matchKeyword(statement, skipSpaceAndComments(statement, end), "STDIN"); ok {
+						return copyIn, end
+					}
+				}
+				if end, ok := matchKeyword(statement, i, "TO"); ok {
+					if end, ok = matchKeyword(statement, skipSpaceAndComments(statement, end), "STDOUT"); ok {
+						return copyOut, end
+					}
+				}
+			}
+			i++
+		}
+	}
+	return copyNone, 0
+}
+
+// matchKeyword matches one word case-insensitively at i, requiring word
+// boundaries so that a longer identifier cannot match.
+func matchKeyword(statement string, i int, word string) (int, bool) {
+	if i < 0 || i+len(word) > len(statement) {
+		return i, false
+	}
+	if !strings.EqualFold(statement[i:i+len(word)], word) {
+		return i, false
+	}
+	if i > 0 && isIdentifierByte(statement[i-1]) {
+		return i, false
+	}
+	if i+len(word) < len(statement) && isIdentifierByte(statement[i+len(word)]) {
+		return i, false
+	}
+	return i + len(word), true
+}
+
+// skipDollarQuoted returns the offset after a dollar-quoted string that starts
+// at i, or i when the text is not a dollar-quote opener.
+func skipDollarQuoted(statement string, i int) int {
+	j := i + 1
+	if j < len(statement) && isTagStartByte(statement[j]) {
+		for j < len(statement) && isIdentifierByte(statement[j]) {
+			j++
+		}
+	}
+	if j >= len(statement) || statement[j] != '$' {
+		return i
+	}
+	tag := statement[i : j+1]
+	end := strings.Index(statement[j+1:], tag)
+	if end < 0 {
+		return len(statement)
+	}
+	return j + 1 + end + len(tag)
+}
+
+func isTagStartByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80
+}
+
+// skipSpaceAndComments skips whitespace, line comments and block comments.
+func skipSpaceAndComments(statement string, i int) int {
+	for i < len(statement) {
+		switch {
+		case isSpace(statement[i]):
+			i++
+		case strings.HasPrefix(statement[i:], "--"):
+			newline := strings.IndexAny(statement[i:], "\n\r")
+			if newline < 0 {
+				return len(statement)
+			}
+			i += newline + 1
+		case strings.HasPrefix(statement[i:], "/*"):
+			end := strings.Index(statement[i+2:], "*/")
+			if end < 0 {
+				return len(statement)
+			}
+			i += 2 + end + 2
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+// isIdentifierByte reports whether c can continue an unquoted SQL identifier.
+func isIdentifierByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '$', c >= 0x80:
+		return true
+	}
+	return false
 }
 
 var errCopyInRequired = errors.New("opengauss: COPY ... FROM STDIN must be started through CopyIn(tx, ...)")
+
+var errCopyOutRequired = errors.New("opengauss: COPY ... TO STDOUT returns rows and must be read with QueryContext")
+
+var errCopyOutParameters = errors.New("opengauss: COPY ... TO STDOUT does not accept parameters; write the statement without placeholders")
 
 // copyStreamError names the COPY direction a server answered with, so an
 // application that sent the statement through the wrong entry point sees which
@@ -104,7 +243,7 @@ func copyStreamError(typ byte) error {
 	case proto.MsgCopyInResponse:
 		return errCopyInRequired
 	case proto.MsgCopyOutResponse:
-		return errors.New("opengauss: COPY ... TO STDOUT is not supported yet")
+		return errCopyOutRequired
 	default:
 		return errors.New("opengauss: the COPY BOTH protocol is not supported")
 	}
@@ -113,20 +252,41 @@ func copyStreamError(typ byte) error {
 // copyInTailError rejects COPY options, because the row encoder always writes
 // the default text format. A CSV or HEADER stream would be parsed under
 // different rules and silently import wrong values.
-func copyInTailError(statement string) error {
-	upper := strings.ToUpper(statement)
-	// The last occurrence is the clause: a quoted identifier may itself
-	// contain the words "FROM STDIN".
-	index := strings.LastIndex(upper, " FROM STDIN")
-	if index < 0 {
-		return nil
-	}
-	rest := statement[index+len(" FROM STDIN"):]
-	for i := 0; i < len(rest); i++ {
-		switch rest[i] {
-		case ' ', '\t', '\n', '\r', '\v', '\f', ';':
+func copyInTailError(statement string, clauseEnd int) error {
+	return copyTailError(statement, clauseEnd,
+		"opengauss: COPY ... FROM STDIN options are not implemented: the driver writes the default text format only")
+}
+
+// copyOutTailError rejects COPY options, because the row decoder always reads
+// the default text format. A CSV stream would be split under different rules
+// and silently produce wrong values.
+func copyOutTailError(statement string, clauseEnd int) error {
+	return copyTailError(statement, clauseEnd,
+		"opengauss: COPY ... TO STDOUT options are not implemented: the driver reads the default text format only")
+}
+
+// copyTailError rejects COPY options, because only the default text format is
+// implemented. Whitespace, comments and a trailing separator may follow the
+// clause; anything else is an option the driver does not implement.
+func copyTailError(statement string, clauseEnd int, message string) error {
+	for i := clauseEnd; i < len(statement); {
+		switch {
+		case isSpace(statement[i]), statement[i] == ';':
+			i++
+		case strings.HasPrefix(statement[i:], "--"):
+			newline := strings.IndexAny(statement[i:], "\n\r")
+			if newline < 0 {
+				return nil
+			}
+			i += newline + 1
+		case strings.HasPrefix(statement[i:], "/*"):
+			end := strings.Index(statement[i+2:], "*/")
+			if end < 0 {
+				return nil
+			}
+			i += 2 + end + 2
 		default:
-			return errors.New("opengauss: COPY ... FROM STDIN options are not implemented: the driver writes the default text format only")
+			return errors.New(message)
 		}
 	}
 	return nil
@@ -226,7 +386,7 @@ func (c *conn) beginCopyIn(ctx context.Context, owner *copyStmt) error {
 		}
 		switch typ {
 		case proto.MsgCopyInResponse:
-			format, columns, err := parseCopyInResponse(body)
+			format, columns, err := parseCopyResponse(body)
 			if err != nil {
 				c.bad = true
 				c.endOperation(watcher)
@@ -405,9 +565,11 @@ func (c *conn) finishCopyIn() (string, error) {
 	}
 }
 
-// parseCopyInResponse reads the format and column count of CopyInResponse. The
-// driver only writes the default text format, so every column must be text.
-func parseCopyInResponse(body []byte) (format byte, columns int, err error) {
+// parseCopyResponse reads the format and column count of a CopyInResponse or
+// CopyOutResponse. The driver only uses the default text format; an overall
+// binary response is reported to the caller, while a binary column inside a
+// text response is a protocol violation because the driver never asks for one.
+func parseCopyResponse(body []byte) (format byte, columns int, err error) {
 	r := &proto.ReadBuf{B: body}
 	format = r.Byte()
 	count := int(r.Int16())
@@ -415,7 +577,11 @@ func parseCopyInResponse(body []byte) (format byte, columns int, err error) {
 		return 0, 0, proto.ErrMalformedMessage
 	}
 	for i := 0; i < count; i++ {
-		if columnFormat := r.Int16(); columnFormat != 0 {
+		columnFormat := r.Int16()
+		if r.Err != nil {
+			return 0, 0, proto.ErrMalformedMessage
+		}
+		if columnFormat != 0 && format == 0 {
 			return 0, 0, fmt.Errorf("opengauss: COPY column %d uses binary format, which this driver does not request", i+1)
 		}
 	}

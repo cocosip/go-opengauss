@@ -37,6 +37,11 @@
 //
 // # Session-scoped helpers
 //
+// CopyIn streams rows into a table inside a transaction with COPY ... FROM
+// STDIN, using the default text format. The inverse direction is read through
+// QueryContext: a COPY ... TO STDOUT statement returns rows whose columns are
+// reported as column1..columnN and whose values are strings, with NULL as nil.
+//
 // NewListener keeps one dedicated session for LISTEN/NOTIFY and reconnects it
 // after a failure, re-registering the channels it had accepted. It is separate
 // from the sql.DB pool because a notification belongs to the session that

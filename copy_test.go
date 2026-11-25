@@ -29,21 +29,32 @@ func TestCopyInSQL(t *testing.T) {
 	}
 }
 
-func TestIsCopyFromStdin(t *testing.T) {
+func TestCopyDirection(t *testing.T) {
 	tests := []struct {
 		statement string
-		want      bool
+		want      copyKind
 	}{
-		{"COPY logs FROM STDIN", true},
-		{"  copy logs (a, b) from stdin", true},
-		{"COPY logs TO STDOUT", false},
-		{"COPY logs FROM 'file.txt'", false},
-		{"INSERT INTO logs VALUES ($1)", false},
-		{"copycat", false},
+		{"COPY logs FROM STDIN", copyIn},
+		{"  copy logs (a, b) from stdin", copyIn},
+		{"COPY logs TO STDOUT", copyOut},
+		{"COPY (SELECT 'FROM STDIN' AS x) TO STDOUT", copyOut},
+		{"COPY (SELECT 'TO STDOUT' AS x) TO STDOUT", copyOut},
+		{"COPY (SELECT $$ FROM STDIN $$) TO STDOUT", copyOut},
+		{"COPY (SELECT $tag$ TO STDOUT $tag$) TO STDOUT", copyOut},
+		{"COPY (SELECT * FROM stdin) TO STDOUT", copyOut},
+		{"COPY (SELECT 1) TO/**/STDOUT", copyOut},
+		{"COPY demotable TO/**/STDOUT -- note", copyOut},
+		{"COPY logs FROM/**/STDIN", copyIn},
+		{"/* FROM STDIN */ COPY logs FROM STDIN", copyIn},
+		{"-- TO STDOUT\nCOPY logs TO STDOUT", copyOut},
+		{"-- COPY logs TO STDOUT\nSELECT 1", copyNone},
+		{"COPY logs FROM 'file.txt'", copyNone},
+		{"INSERT INTO logs VALUES ($1)", copyNone},
+		{"copycat", copyNone},
 	}
 	for _, tc := range tests {
-		if got := isCopyFromStdin(tc.statement); got != tc.want {
-			t.Errorf("isCopyFromStdin(%q) = %v, want %v", tc.statement, got, tc.want)
+		if got, _ := copyDirection(tc.statement); got != tc.want {
+			t.Errorf("copyDirection(%q) = %v, want %v", tc.statement, got, tc.want)
 		}
 	}
 }
@@ -743,7 +754,7 @@ func TestCopyInToleratesTrailingSemicolon(t *testing.T) {
 	}
 }
 
-func TestParseCopyInResponseFormats(t *testing.T) {
+func TestParseCopyResponseFormats(t *testing.T) {
 	body := func(overall byte, formats ...byte) []byte {
 		m := proto.NewMessageWriter(proto.MsgCopyInResponse)
 		m.Byte(overall)
@@ -754,16 +765,16 @@ func TestParseCopyInResponseFormats(t *testing.T) {
 		return m.Finish()[5:]
 	}
 
-	format, columns, err := parseCopyInResponse(body(0, 0, 0))
+	format, columns, err := parseCopyResponse(body(0, 0, 0))
 	if err != nil || format != 0 || columns != 2 {
-		t.Fatalf("parseCopyInResponse = (%d, %d, %v), want text with two columns", format, columns, err)
+		t.Fatalf("parseCopyResponse = (%d, %d, %v), want text with two columns", format, columns, err)
 	}
-	if _, _, err := parseCopyInResponse(body(0, 1)); err == nil ||
+	if _, _, err := parseCopyResponse(body(0, 1)); err == nil ||
 		!strings.Contains(err.Error(), "column 1 uses binary format") {
 		t.Fatalf("per-column binary format = %v, want a refusal", err)
 	}
-	if _, _, err := parseCopyInResponse([]byte{0, 0}); err == nil {
-		t.Error("a truncated CopyInResponse was accepted")
+	if _, _, err := parseCopyResponse([]byte{0, 0}); err == nil {
+		t.Error("a truncated copy response was accepted")
 	}
 }
 
