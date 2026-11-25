@@ -34,3 +34,35 @@ func FuzzParseRowDescription(f *testing.F) {
 		_, _ = parseRowDescription(data)
 	})
 }
+
+func FuzzParseDSN(f *testing.F) {
+	f.Add("host=127.0.0.1 port=5432 user=u password='a b' dbname=d sslmode=disable")
+	f.Add("host=h1,h2 port=5432,5433 user=u dbname=d sslmode=require connect_timeout=5")
+	f.Add("postgres://u:p@h1:5432,h2/db?sslmode=verify-full&connect_timeout=5")
+	f.Add("postgresql://u@[::1]:5432/db")
+	f.Add("user=u password='it''s' dbname=d")
+	f.Add("")
+	f.Fuzz(func(t *testing.T, dsn string) {
+		_, _ = parseDSN(dsn)
+	})
+}
+
+func FuzzCopyDirection(f *testing.F) {
+	f.Add("COPY t FROM STDIN")
+	f.Add("COPY t (a, b) FROM STDIN WITH (FORMAT csv)")
+	f.Add("COPY t TO STDOUT")
+	f.Add("COPY (SELECT 'COPY x FROM STDIN') TO STDOUT")
+	f.Add("SELECT 'COPY t FROM STDIN'")
+	f.Add("-- COPY t FROM STDIN\nSELECT 1")
+	f.Add("/* COPY t TO STDOUT */ SELECT 1")
+	f.Add("copy \"COPY\" from stdin")
+	f.Fuzz(func(t *testing.T, statement string) {
+		kind, clauseEnd := copyDirection(statement)
+		if clauseEnd < 0 || clauseEnd > len(statement) {
+			t.Fatalf("copyDirection(%q) returned clause end %d", statement, clauseEnd)
+		}
+		if kind == copyNone && clauseEnd != 0 {
+			t.Fatalf("copyDirection(%q) = none with clause end %d", statement, clauseEnd)
+		}
+	})
+}
