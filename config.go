@@ -218,7 +218,8 @@ func parseKeywordDSN(dsn string) (map[string]string, error) {
 			i++
 		}
 		if i >= n || dsn[i] != '=' {
-			return nil, fmt.Errorf("opengauss: invalid keyword/value DSN: parameter %q has no =value", key)
+			// Do not echo the token: a malformed DSN may carry a password.
+			return nil, errors.New("opengauss: invalid keyword/value DSN: expected key=value")
 		}
 		i++ // consume '='
 		for i < n && isSpace(dsn[i]) {
@@ -273,7 +274,7 @@ func parseURLDSN(dsn string) (map[string]string, error) {
 	if schemeEnd <= 0 {
 		return nil, errors.New("opengauss: invalid URL DSN: missing scheme")
 	}
-	scheme := dsn[:schemeEnd]
+	scheme := strings.ToLower(dsn[:schemeEnd])
 	switch scheme {
 	case "postgres", "postgresql", "opengauss":
 	default:
@@ -375,6 +376,11 @@ func parseURLHostList(raw string) (hosts, ports []string, anyPort bool, err erro
 		if host == "" {
 			return nil, nil, false, errors.New("opengauss: invalid URL DSN: empty host in the host list")
 		}
+		unescaped, err := url.PathUnescape(host)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("opengauss: invalid URL DSN: host %q is not valid percent-encoded text", host)
+		}
+		host = unescaped
 		if hasPort {
 			anyPort = true
 		} else {
@@ -426,7 +432,9 @@ func newConfig(values map[string]string) (*Config, error) {
 			cfg.User = value
 		case "password":
 			cfg.Password = value
-			cfg.passwordSet = true
+			// An explicit empty password still allows the passfile to supply
+			// one, as libpq does; a non-empty value applies to every target.
+			cfg.passwordSet = value != ""
 		case "dbname", "database":
 			if cfg.Database != "" && cfg.Database != value {
 				return nil, errors.New("opengauss: dbname and database are both specified with different values")

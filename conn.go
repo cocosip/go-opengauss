@@ -47,6 +47,29 @@ func stageOf(err error) string {
 	return ""
 }
 
+// failureHasStage reports whether any failure inside err, including the
+// members of a joined TLS fallback, happened at the given stage.
+func failureHasStage(err error, stage string) bool {
+	if err == nil {
+		return false
+	}
+	if target, ok := err.(*stageError); ok && target.stage == stage {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if failureHasStage(child, stage) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return failureHasStage(wrapped.Unwrap(), stage)
+	}
+	return false
+}
+
 type conn struct {
 	netConn  net.Conn
 	br       *bufio.Reader
@@ -79,8 +102,10 @@ func connect(ctx context.Context, cfg *Config) (*conn, error) {
 		errs = append(errs, fmt.Errorf("opengauss: connect to %s: %w", target, err))
 		// libpq stops at an authentication failure: the credentials were
 		// rejected, so they are not replayed against the remaining targets.
-		if stageOf(err) == stageAuthentication {
-			return nil, errs[0]
+		// The check covers the second attempt of an allow/prefer fallback,
+		// where the joined failure is not the first error of the join.
+		if failureHasStage(err, stageAuthentication) {
+			break
 		}
 		if ctx.Err() != nil {
 			break

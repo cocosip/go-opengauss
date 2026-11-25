@@ -308,6 +308,60 @@ func TestDefaultServiceFileOnWindows(t *testing.T) {
 	}
 }
 
+func TestEmptyPasswordFallsBackToPassfile(t *testing.T) {
+	clearPGEnvironment(t)
+	passfile := writeConfigFile(t, "pgpass", "127.0.0.1:5432:app:alice:filepass\n")
+
+	for _, dsn := range []string{
+		"host=127.0.0.1 port=5432 dbname=app user=alice password='' passfile=" + filepath.ToSlash(passfile),
+		"postgres://alice:@127.0.0.1:5432/app?passfile=" + filepath.ToSlash(passfile),
+	} {
+		cfg, err := parseConfig(dsn)
+		if err != nil {
+			t.Fatalf("parseConfig(%q): %v", dsn, err)
+		}
+		if cfg.Password != "filepass" {
+			t.Errorf("parseConfig(%q) Password = %q, want the passfile value", dsn, cfg.Password)
+		}
+	}
+}
+
+func TestURLSchemeIsCaseInsensitive(t *testing.T) {
+	clearPGEnvironment(t)
+	for _, dsn := range []string{"POSTGRES://alice@db/app", "Postgresql://alice@db/app"} {
+		cfg, err := parseConfig(dsn)
+		if err != nil {
+			t.Errorf("parseConfig(%q): %v", dsn, err)
+			continue
+		}
+		if cfg.Host != "db" || cfg.User != "alice" {
+			t.Errorf("parseConfig(%q) = %s/%s", dsn, cfg.User, cfg.Host)
+		}
+	}
+}
+
+func TestURLPercentEncodedHostIsDecoded(t *testing.T) {
+	clearPGEnvironment(t)
+	cfg, err := parseConfig("postgres://alice@ho%73t/app")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.Host != "host" {
+		t.Errorf("Host = %q, want the decoded host", cfg.Host)
+	}
+}
+
+func TestMalformedKeywordDSNDoesNotEchoValue(t *testing.T) {
+	clearPGEnvironment(t)
+	_, err := parseConfig("postgres:/alice:topsecret@host/db")
+	if err == nil {
+		t.Fatal("expected a malformed DSN error")
+	}
+	if strings.Contains(err.Error(), "topsecret") {
+		t.Errorf("error %q echoes the DSN", err)
+	}
+}
+
 func TestClientCertificateParameters(t *testing.T) {
 	clearPGEnvironment(t)
 

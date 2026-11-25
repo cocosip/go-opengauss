@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"github.com/cocosip/go-opengauss/internal/auth"
 	"github.com/cocosip/go-opengauss/internal/proto"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -1095,6 +1096,119 @@ func TestMultiHostAggregateErrorsAreDiscoverable(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want errors.Is(context.Canceled)", err)
 	}
+}
+
+func TestMultiHostStopsAfterFallbackAuthenticationFailure(t *testing.T) {
+	// sslmode=prefer fails the TLS attempt on the first target and the
+	// authentication on its plaintext retry, so the joined failure does not
+	// begin with the authentication error.
+	var (
+		mu       sync.Mutex
+		attempts int
+	)
+	rejecting := newFakeServer(t, func(s *fakeSession) {
+		mu.Lock()
+		attempts++
+		current := attempts
+		mu.Unlock()
+
+		if current%2 == 1 {
+			// First attempt: refuse TLS so the policy falls back to plaintext.
+			s.rejectTLS()
+			return
+		}
+		s.readStartup()
+		s.sendAuthenticationSHA256(katSalt, katToken, 10000)
+		s.expectPassword()
+		s.sendError("28P01", `password authentication failed for user "alice"`)
+	})
+	second := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+	})
+
+	dsn := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d user=%s password=%s dbname=%s sslmode=prefer",
+		rejecting.port(), second.port(), testUser, testPassword, testDatabase)
+	db := openTestDB(t, dsn)
+	if err := db.PingContext(testContext(t)); err == nil {
+		t.Fatal("expected the rejected password to fail the connection")
+	}
+	if got := second.connections(); got != 0 {
+		t.Errorf("second target accepted %d connections after a rejected password, want 0", got)
+	}
+}
+
+func TestMultiHostReportsLaterAuthenticationFailure(t *testing.T) {
+	rejecting := newFakeServer(t, func(s *fakeSession) {
+		s.readStartup()
+		s.sendAuthenticationSHA256(katSalt, katToken, 10000)
+		s.expectPassword()
+		s.sendError("28P01", `password authentication failed for user "alice"`)
+	})
+
+	dsn := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d user=%s password=%s dbname=%s sslmode=disable",
+		closedPort(t), rejecting.port(), testUser, testPassword, testDatabase)
+	db := openTestDB(t, dsn)
+	err := db.PingContext(testContext(t))
+	if err == nil {
+		t.Fatal("expected the second target to reject the password")
+	}
+	var serverErr *Error
+	if !errors.As(err, &serverErr) {
+		t.Fatalf("error %v does not expose the server *Error", err)
+	}
+	if serverErr.SQLState() != "28P01" {
+		t.Errorf("SQLState = %q, want 28P01 from the second target", serverErr.SQLState())
+	}
+}
+
+func TestConnectTimeoutAppliesPerTarget(t *testing.T) {
+	// The server accepts and never answers, so the whole target attempt is
+	// bounded by connect_timeout; the old per-attempt timer would take twice
+	// as long under sslmode=allow.
+	silent := newSilentServer(t)
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=%s password=%s dbname=%s sslmode=allow connect_timeout=1",
+		silent, testUser, testPassword, testDatabase)
+
+	db := openTestDB(t, dsn)
+	start := time.Now()
+	if err := db.PingContext(testContext(t)); err == nil {
+		t.Fatal("expected the silent server to time out")
+	}
+	if elapsed := time.Since(start); elapsed > 1800*time.Millisecond {
+		t.Errorf("connect_timeout took %v, want about 1s for the target", elapsed)
+	}
+}
+
+// newSilentServer listens and accepts without ever replying, returning its
+// port.
+func newSilentServer(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() { _ = conn.Close() }()
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		wg.Wait()
+	})
+	return ln.Addr().(*net.TCPAddr).Port
 }
 
 // closedPort returns a local port with no listener.
