@@ -186,3 +186,66 @@ func TestLiveNotifications(t *testing.T) {
 	publish("after unlisten")
 	expectNoNotification("the channel was unlistened")
 }
+
+// TestLiveMultiVectorSearch runs the F11 acceptance steps against a real
+// server: a vector table, two search vectors in parallel, scan settings applied
+// to each session and an ordered per-item result. It is skipped unless
+// OPENGAUSS_DSN is set and the server provides the vector type.
+func TestLiveMultiVectorSearch(t *testing.T) {
+	dsn := os.Getenv("OPENGAUSS_DSN")
+	if dsn == "" {
+		t.Skip("set OPENGAUSS_DSN to run against a live openGauss server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
+
+	// The table is permanent because each worker searches on its own session
+	// and temporary tables are visible only to their creator.
+	table := fmt.Sprintf("opengauss_live_vector_%d", os.Getpid())
+	if _, err := db.ExecContext(ctx, "CREATE TABLE "+table+" (id integer, embedding vector(3))"); err != nil {
+		t.Skipf("the server does not provide the vector type: %v", err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+table)
+	}()
+
+	for i, vector := range []string{"[1,0,0]", "[0,1,0]", "[0,0,1]"} {
+		if _, err := db.ExecContext(ctx, "INSERT INTO "+table+" (id, embedding) VALUES ($1, $2::vector)", i+1, vector); err != nil {
+			t.Fatalf("INSERT vector %d: %v", i+1, err)
+		}
+	}
+
+	query := "SELECT id FROM " + table + " ORDER BY embedding <-> $1 LIMIT $2"
+	results, err := ExecuteMultiSearch(ctx, db, query,
+		[][]any{{"[1,0,0]", 2}, {"[0,1,0]", 2}},
+		map[string]any{"enable_seqscan": "on"}, 2)
+	if err != nil {
+		t.Fatalf("ExecuteMultiSearch: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %d, want 2", len(results))
+	}
+	for i, want := range []int64{1, 2} {
+		if results[i].Err != nil {
+			t.Fatalf("result %d: %v", i, results[i].Err)
+		}
+		if len(results[i].Rows) != 2 {
+			t.Fatalf("result %d rows = %d, want the requested limit", i, len(results[i].Rows))
+		}
+		id, ok := results[i].Rows[0]["id"].(int64)
+		if !ok || id != want {
+			t.Errorf("result %d nearest id = %v, want %d", i, results[i].Rows[0]["id"], want)
+		}
+	}
+}
