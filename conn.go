@@ -85,6 +85,14 @@ type conn struct {
 	txnStatus   byte
 	stmtCounter int
 
+	// An open COPY stream owns the session until CopyDone: copying records
+	// that state, copyColumns is the row width from CopyInResponse, and the
+	// watcher and context belong to the call that started the stream.
+	copying     bool
+	copyColumns int
+	copyWatcher *cancelWatcher
+	copyCtx     context.Context
+
 	// bad marks a connection whose protocol state can no longer be trusted.
 	// Public methods return driver.ErrBadConn once it is set so database/sql
 	// discards the connection instead of reusing a desynchronized session.
@@ -587,6 +595,11 @@ func (c *conn) beginOperation(ctx context.Context) (*cancelWatcher, error) {
 	}
 	if c.bad {
 		return nil, driver.ErrBadConn
+	}
+	// A session in the middle of a COPY stream belongs to that stream until it
+	// finishes; any other statement would interleave with the CopyData frames.
+	if c.copying {
+		return nil, errors.New("opengauss: a COPY stream is still open on this session")
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := c.netConn.SetDeadline(deadline); err != nil {

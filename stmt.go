@@ -28,6 +28,14 @@ func (c *conn) PrepareContext(ctx context.Context, statement string) (driver.Stm
 	if err := validateQuery(statement); err != nil {
 		return nil, err
 	}
+	// A COPY stream is not prepared on the server: it keeps the simple query
+	// protocol so rows can be appended without a Bind/Execute per row.
+	if isCopyFromStdin(statement) {
+		if c.bad {
+			return nil, driver.ErrBadConn
+		}
+		return &copyStmt{conn: c, statement: statement}, nil
+	}
 
 	watcher, err := c.beginOperation(ctx)
 	if err != nil {

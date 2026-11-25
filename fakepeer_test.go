@@ -602,3 +602,37 @@ func readOnlyText(readOnly bool) string {
 	}
 	return "off"
 }
+
+// sendCopyInResponse announces the row width of a COPY ... FROM STDIN stream.
+func (s *fakeSession) sendCopyInResponse(format byte, columns int) {
+	m := proto.NewMessageWriter(proto.MsgCopyInResponse)
+	m.Byte(format)
+	m.Int16(int16(columns))
+	for i := 0; i < columns; i++ {
+		m.Int16(int16(format))
+	}
+	s.writeRaw(m.Finish())
+}
+
+// readCopyRows collects the CopyData payloads of one stream until CopyDone.
+func (s *fakeSession) readCopyRows() []string {
+	var rows []string
+	for {
+		typ, body := s.readMessage()
+		if s.err != nil {
+			return rows
+		}
+		switch typ {
+		case proto.MsgCopyData:
+			rows = append(rows, string(body))
+		case proto.MsgCopyDone:
+			return rows
+		case proto.MsgCopyFail:
+			s.fail("COPY aborted with %q", string(body))
+			return rows
+		default:
+			s.fail("unexpected message %q during COPY", typ)
+			return rows
+		}
+	}
+}
