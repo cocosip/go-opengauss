@@ -48,6 +48,20 @@ The proposed initial surface is `sql.Open("opengauss", dsn)` and `opengauss.NewC
 
 For the first milestone, accept `host`, `port`, `dbname`, `user`, `password`, `sslmode`, `sslrootcert` and `connect_timeout` for a single TCP endpoint. Support keyword/value syntax and a single-host URL. Keep explicit settings authoritative. Exercise verify-full first and preserve the DNS name for certificate verification. The compatibility target for omitted sslmode is upstream's prefer. Until a requested mode or DSN option is implemented, reject it explicitly instead of silently ignoring it or selecting a weaker mode. Complete service/passfile, multi-host and the remaining F01 cases before marking F01 complete.
 
+## Migration notes for unimplemented settings
+
+These upstream options are rejected with an explicit error rather than ignored. A caller migrating from the reference driver must change its configuration:
+
+| Setting | Behaviour here | Migration |
+| --- | --- | --- |
+| `sslinline` | Rejected as an unsupported parameter | Write the certificate and key to files with owner-only permissions and pass `sslcert`/`sslkey` |
+| `sslpassword` | Rejected: only unencrypted key files are read | Decrypt the key once at configuration time, or use `crypto/tls` through a future custom-config entry point |
+| Custom `TLSConfig` | Not exposed; the driver derives one policy from `sslmode` plus the certificate parameters | Use one of the six `sslmode` values, `sslrootcert`, `sslcert` and `sslkey`; a programmatic TLS hook is a future extension |
+| Custom dialer, `DialFunc` | Not exposed; targets are dialed with `net.Dialer` and the caller's context | Resolve or proxy at the network layer; a dialer hook is a future extension |
+| `mogdb` driver name | Not registered | Change the driver name in `sql.Open` to `opengauss`; registering both names would duplicate the same implementation |
+
+Registering only one name is deliberate: `database/sql` keys drivers by name, so a second alias would silently create a second independent pool for the same database.
+
 Expose server failures as `*opengauss.Error` with `SQLState() string`, discoverable via `errors.As`. Preserve the original server code and message. Wrap local connection errors so `errors.Is` can identify context cancellation and deadline expiry. Connector.Connect must not return driver.ErrBadConn. An unsupported authentication method is a local protocol error and must not acquire an invented SQLSTATE. These API choices are project decisions to be tested through both public entry points.
 
 ## Pure Go requirement
