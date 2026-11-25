@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -962,6 +963,152 @@ func TestPassfilePasswordAuthenticates(t *testing.T) {
 	if err := db.PingContext(testContext(t)); err != nil {
 		t.Fatalf("PingContext with a passfile password: %v", err)
 	}
+}
+
+func TestMultiHostFallsBackToSecondTarget(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		if query := s.expectSimpleQuery(); query != "" {
+			s.fail("ping query = %q", query)
+		}
+		s.sendEmptyQueryResponse()
+		s.sendReady(proto.TxnIdle)
+	})
+
+	closed := closedPort(t)
+	dsn := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d user=%s password=%s dbname=%s sslmode=disable",
+		closed, server.port(), testUser, testPassword, testDatabase)
+	db := openTestDB(t, dsn)
+	if err := db.PingContext(testContext(t)); err != nil {
+		t.Fatalf("PingContext with a second target: %v", err)
+	}
+	if got := server.connections(); got != 1 {
+		t.Errorf("connections = %d, want 1", got)
+	}
+}
+
+func TestMultiHostReportsEveryFailedTarget(t *testing.T) {
+	first, second := closedPort(t), closedPort(t)
+	dsn := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d user=%s sslmode=disable",
+		first, second, testUser)
+	db := openTestDB(t, dsn)
+	err := db.PingContext(testContext(t))
+	if err == nil {
+		t.Fatal("expected every target to fail")
+	}
+	message := err.Error()
+	if !strings.Contains(message, strconv.Itoa(first)) || !strings.Contains(message, strconv.Itoa(second)) {
+		t.Errorf("error %q does not name both targets", message)
+	}
+}
+
+func TestMultiHostUsesPerTargetServerName(t *testing.T) {
+	cert, caPEM := newTestCertificate(t, []string{"localhost"}, nil)
+	rootCert := writeRootCert(t, caPEM)
+
+	server := newFakeServer(t, func(s *fakeSession) {
+		if !s.acceptTLS(cert) {
+			return
+		}
+		s.completeStartup(nil)
+
+		if query := s.expectSimpleQuery(); query != "" {
+			s.fail("ping query = %q", query)
+		}
+		s.sendEmptyQueryResponse()
+		s.sendReady(proto.TxnIdle)
+	})
+
+	// The first target is unreachable, so the connection comes from the
+	// second one, whose certificate names localhost rather than the first
+	// target's address.
+	dsn := fmt.Sprintf("host=127.0.0.1,%s port=%d,%d user=%s password=%s dbname=%s sslmode=verify-full sslrootcert=%s",
+		"localhost", closedPort(t), server.port(), testUser, testPassword, testDatabase, filepath.ToSlash(rootCert))
+	db := openTestDB(t, dsn)
+	if err := db.PingContext(testContext(t)); err != nil {
+		t.Fatalf("verify-full against the second target: %v", err)
+	}
+}
+
+func TestMultiHostStopsAfterAuthenticationFailure(t *testing.T) {
+	rejecting := newFakeServer(t, func(s *fakeSession) {
+		s.readStartup()
+		// Send an unsupported method so the client fails before any second
+		// target is contacted.
+		m := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+		m.Int32(auth.RequestGSS)
+		s.writeRaw(m.Finish())
+	})
+	second := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+	})
+
+	dsn := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d user=%s password=%s dbname=%s sslmode=disable",
+		rejecting.port(), second.port(), testUser, testPassword, testDatabase)
+	db := openTestDB(t, dsn)
+	err := db.PingContext(testContext(t))
+	if err == nil {
+		t.Fatal("expected the authentication failure to be reported")
+	}
+	if !strings.Contains(err.Error(), "authentication") {
+		t.Errorf("error = %v, want an authentication failure", err)
+	}
+	if got := second.connections(); got != 0 {
+		t.Errorf("second target accepted %d connections, want 0", got)
+	}
+}
+
+func TestMultiHostPassfileMatchesEachTarget(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		if query := s.expectSimpleQuery(); query != "" {
+			s.fail("ping query = %q", query)
+		}
+		s.sendEmptyQueryResponse()
+		s.sendReady(proto.TxnIdle)
+	})
+
+	// Only the second target has an entry, so a first-target-only lookup
+	// would leave the password empty and fail authentication.
+	passfile := writeConfigFile(t, "pgpass", fmt.Sprintf("127.0.0.1:%d:%s:%s:%s\n",
+		server.port(), testDatabase, testUser, testPassword))
+	dsn := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d user=%s dbname=%s sslmode=disable passfile=%s",
+		closedPort(t), server.port(), testUser, testDatabase, filepath.ToSlash(passfile))
+
+	db := openTestDB(t, dsn)
+	if err := db.PingContext(testContext(t)); err != nil {
+		t.Fatalf("PingContext with a passfile entry for the second target: %v", err)
+	}
+}
+
+func TestMultiHostAggregateErrorsAreDiscoverable(t *testing.T) {
+	first, second := closedPort(t), closedPort(t)
+	dsn := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d user=%s sslmode=disable",
+		first, second, testUser)
+	db := openTestDB(t, dsn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := db.PingContext(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want errors.Is(context.Canceled)", err)
+	}
+}
+
+// closedPort returns a local port with no listener.
+func closedPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return port
 }
 
 func newTestCertificate(t *testing.T, dnsNames []string, ips []net.IP) (tls.Certificate, []byte) {

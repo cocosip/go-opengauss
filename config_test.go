@@ -120,6 +120,161 @@ func TestParseConfigLastValueWins(t *testing.T) {
 	}
 }
 
+func TestParseConfigMultiHostKeyword(t *testing.T) {
+	clearPGEnvironment(t)
+	cfg, err := parseConfig("user=alice host=db1,db2 port=5432,6432")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if len(cfg.Targets) != 2 {
+		t.Fatalf("Targets = %v, want two endpoints", cfg.Targets)
+	}
+	if cfg.Targets[0] != (Target{Host: "db1", Port: 5432}) || cfg.Targets[1] != (Target{Host: "db2", Port: 6432}) {
+		t.Errorf("Targets = %v", cfg.Targets)
+	}
+	if cfg.Host != "db1" || cfg.Port != 5432 {
+		t.Errorf("Host/Port = %s:%d, want the first endpoint", cfg.Host, cfg.Port)
+	}
+}
+
+func TestParseConfigSinglePortAppliesToAllHosts(t *testing.T) {
+	clearPGEnvironment(t)
+	cfg, err := parseConfig("user=alice host=db1,db2 port=6000")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if len(cfg.Targets) != 2 || cfg.Targets[0].Port != 6000 || cfg.Targets[1].Port != 6000 {
+		t.Errorf("Targets = %v, want port 6000 for both hosts", cfg.Targets)
+	}
+}
+
+func TestParseConfigPortCountMismatchRejects(t *testing.T) {
+	clearPGEnvironment(t)
+	if _, err := parseConfig("user=alice host=db1,db2 port=5432,5433,5434"); err == nil ||
+		!strings.Contains(err.Error(), "port") {
+		t.Errorf("error = %v, want a port-count error", err)
+	}
+}
+
+func TestParseConfigMultiHostURL(t *testing.T) {
+	clearPGEnvironment(t)
+	cfg, err := parseConfig("postgres://alice:secret@db1:5432,db2:6432/app?sslmode=disable")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if len(cfg.Targets) != 2 || cfg.Targets[0].Host != "db1" || cfg.Targets[0].Port != 5432 ||
+		cfg.Targets[1].Host != "db2" || cfg.Targets[1].Port != 6432 {
+		t.Errorf("Targets = %v", cfg.Targets)
+	}
+}
+
+func TestParseConfigMultiHostURLUsesDefaultPort(t *testing.T) {
+	clearPGEnvironment(t)
+	cfg, err := parseConfig("postgres://alice@db1,db2:6432/app")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if len(cfg.Targets) != 2 || cfg.Targets[0].Port != 5432 || cfg.Targets[1].Port != 6432 {
+		t.Errorf("Targets = %v, want the default port for the host without one", cfg.Targets)
+	}
+}
+
+func TestParseConfigRejectsEmptyHostListEntry(t *testing.T) {
+	clearPGEnvironment(t)
+	if _, err := parseConfig("user=alice host=db1,,db2"); err == nil ||
+		!strings.Contains(err.Error(), "host") {
+		t.Errorf("error = %v, want a host-list error", err)
+	}
+}
+
+func TestConfigStringUsesFirstTarget(t *testing.T) {
+	clearPGEnvironment(t)
+	cfg, err := parseConfig("user=alice host=db1,db2 port=5432,6432 dbname=app")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if got := cfg.String(); !strings.Contains(got, "db1:5432") {
+		t.Errorf("String() = %q, want the first endpoint", got)
+	}
+}
+
+func TestParseConfigRejectsEmptyHostAndPort(t *testing.T) {
+	clearPGEnvironment(t)
+	for _, dsn := range []string{"user=alice host=", "user=alice port=", "user=alice host=db1, port=5432"} {
+		if _, err := parseConfig(dsn); err == nil {
+			t.Errorf("parseConfig(%q) accepted an empty host or port", dsn)
+		}
+	}
+}
+
+func TestParseConfigURLHostListVariants(t *testing.T) {
+	clearPGEnvironment(t)
+	tests := []struct {
+		name string
+		dsn  string
+		want []Target
+	}{
+		{
+			"mixed explicit and default port",
+			"postgres://alice@h1:5432,h2/db",
+			[]Target{{"h1", 5432}, {"h2", 5432}},
+		},
+		{
+			"explicit ports",
+			"postgres://alice@h1:5432,h2:6432/db",
+			[]Target{{"h1", 5432}, {"h2", 6432}},
+		},
+		{
+			"bracketed IPv6",
+			"postgres://alice@[::1]:5432,[2001:db8::2]:6432/db",
+			[]Target{{"::1", 5432}, {"2001:db8::2", 6432}},
+		},
+		{
+			"bracketed IPv6 without port",
+			"postgres://alice@[::1],[::2]/db",
+			[]Target{{"::1", 5432}, {"::2", 5432}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseConfig(tc.dsn)
+			if err != nil {
+				t.Fatalf("parseConfig: %v", err)
+			}
+			if len(cfg.Targets) != len(tc.want) {
+				t.Fatalf("Targets = %v, want %v", cfg.Targets, tc.want)
+			}
+			for i := range tc.want {
+				if cfg.Targets[i] != tc.want[i] {
+					t.Errorf("Targets[%d] = %v, want %v", i, cfg.Targets[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseConfigURLQueryPortWithoutAuthorityPort(t *testing.T) {
+	clearPGEnvironment(t)
+	cfg, err := parseConfig("postgres://alice@h1,h2/db?port=6432")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if len(cfg.Targets) != 2 || cfg.Targets[0].Port != 6432 || cfg.Targets[1].Port != 6432 {
+		t.Errorf("Targets = %v, want port 6432 for both hosts", cfg.Targets)
+	}
+}
+
+func TestParseConfigURLUserinfoEscapes(t *testing.T) {
+	clearPGEnvironment(t)
+	cfg, err := parseConfig("postgres://ali%3Ace:p%40ss%2Fword@db/app")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.User != "ali:ce" || cfg.Password != "p@ss/word" {
+		t.Errorf("credentials = %q/%q", cfg.User, cfg.Password)
+	}
+}
+
 func TestParseConfigRejects(t *testing.T) {
 	clearPGEnvironment(t)
 	tests := []struct {
@@ -138,7 +293,6 @@ func TestParseConfigRejects(t *testing.T) {
 		{"bad connect_timeout", "user=alice connect_timeout=soon", "connect_timeout"},
 		{"negative connect_timeout", "user=alice connect_timeout=-3", "connect_timeout"},
 		{"unknown scheme", "mysql://alice@localhost/db", "scheme"},
-		{"multi host URL", "postgres://alice@h1:5432,h2:5432/db", "multi-host"},
 		{"dbname twice", "postgres://alice@localhost/db?dbname=other", "dbname"},
 		{"dbname conflict", "user=alice dbname=a database=b", "dbname"},
 		{"unknown URL parameter", "postgres://alice@localhost/db?gssencmode=prefer", "gssencmode"},

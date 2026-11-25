@@ -14,7 +14,7 @@ import (
 // sslrootcert is omitted for a verify-* mode, Go's system roots are used,
 // unlike libpq's ~/.postgresql/root.crt default.
 func (c *Config) buildTLSConfig() (*tls.Config, error) {
-	tlsConfig := &tls.Config{ServerName: c.Host}
+	tlsConfig := &tls.Config{}
 	switch c.SSLMode {
 	case SSLModeVerifyFull:
 		// Go's default verification checks both the chain and the host name.

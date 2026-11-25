@@ -14,11 +14,10 @@ import (
 	"github.com/cocosip/go-opengauss/internal/pgpassfile"
 )
 
-// lookupPassfile returns the password that matches the connection parameters
-// from a libpq passfile. A missing default file is not an error; a file named
-// explicitly must be readable, and on Unix it must not be accessible to group
-// or others.
-func lookupPassfile(path string, explicit bool, cfg *Config) (string, error) {
+// lookupPassfile returns the password that matches target from a libpq
+// passfile. A missing default file is not an error; a file named explicitly
+// must be readable, and on Unix it must not be accessible to group or others.
+func lookupPassfile(path string, explicit bool, target Target, database, user string) (string, error) {
 	if path == "" {
 		path = defaultPassfile()
 	}
@@ -43,7 +42,7 @@ func lookupPassfile(path string, explicit bool, cfg *Config) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("opengauss: parse passfile %q: %w", path, err)
 	}
-	password := passfile.FindPassword(cfg.Host, strconv.Itoa(cfg.Port), cfg.Database, cfg.User)
+	password := passfile.FindPassword(target.Host, strconv.Itoa(target.Port), database, user)
 	if strings.IndexByte(password, 0) >= 0 {
 		return "", fmt.Errorf("opengauss: passfile %q contains a NUL byte in a matched password", path)
 	}

@@ -12,7 +12,6 @@ import (
 	"github.com/cocosip/go-opengauss/internal/proto"
 	"io"
 	"net"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -49,9 +48,11 @@ func stageOf(err error) string {
 }
 
 type conn struct {
-	netConn net.Conn
-	br      *bufio.Reader
-	config  *Config
+	netConn  net.Conn
+	br       *bufio.Reader
+	config   *Config
+	target   Target
+	password string
 
 	// Facts observed during startup and refreshed by ReadyForQuery.
 	parameters  map[string]string
@@ -66,14 +67,45 @@ type conn struct {
 	bad bool
 }
 
-// connect opens one physical connection according to the configured TLS
-// policy, falling back only where the policy allows it.
+// connect opens one physical connection. Targets are tried in order, and only
+// the TLS fallback rules of the configured policy may retry within a target.
 func connect(ctx context.Context, cfg *Config) (*conn, error) {
+	errs := make([]error, 0, len(cfg.Targets))
+	for _, target := range cfg.Targets {
+		c, err := connectTarget(ctx, cfg, target)
+		if err == nil {
+			return c, nil
+		}
+		errs = append(errs, fmt.Errorf("opengauss: connect to %s: %w", target, err))
+		// libpq stops at an authentication failure: the credentials were
+		// rejected, so they are not replayed against the remaining targets.
+		if stageOf(err) == stageAuthentication {
+			return nil, errs[0]
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, fmt.Errorf("opengauss: no target accepted a connection: %w", errors.Join(errs...))
+}
+
+// connectTarget applies the TLS fallback policy of one endpoint. The
+// connect_timeout covers every attempt against that endpoint.
+func connectTarget(ctx context.Context, cfg *Config, target Target) (*conn, error) {
+	password, err := cfg.passwordForTarget(target)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ConnectTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
+		defer cancel()
+	}
 	switch cfg.SSLMode {
 	case SSLModeDisable:
-		return connectOnce(ctx, cfg, false)
+		return connectOnce(ctx, cfg, target, password, false)
 	case SSLModeAllow:
-		plain, plainErr := connectOnce(ctx, cfg, false)
+		plain, plainErr := connectOnce(ctx, cfg, target, password, false)
 		if plainErr == nil {
 			return plain, nil
 		}
@@ -83,43 +115,41 @@ func connect(ctx context.Context, cfg *Config) (*conn, error) {
 		if stageOf(plainErr) != stageStartup {
 			return nil, plainErr
 		}
-		secure, secureErr := connectOnce(ctx, cfg, true)
+		secure, secureErr := connectOnce(ctx, cfg, target, password, true)
 		if secureErr == nil {
 			return secure, nil
 		}
-		return nil, joinConnectErrors(cfg, plainErr, secureErr)
+		return nil, errors.Join(plainErr, secureErr)
 	case SSLModePrefer:
-		secure, secureErr := connectOnce(ctx, cfg, true)
+		secure, secureErr := connectOnce(ctx, cfg, target, password, true)
 		if secureErr == nil {
 			return secure, nil
 		}
 		if stageOf(secureErr) != stageTLS {
 			return nil, secureErr
 		}
-		plain, plainErr := connectOnce(ctx, cfg, false)
+		plain, plainErr := connectOnce(ctx, cfg, target, password, false)
 		if plainErr == nil {
 			return plain, nil
 		}
-		return nil, joinConnectErrors(cfg, secureErr, plainErr)
+		return nil, errors.Join(secureErr, plainErr)
 	default:
-		return connectOnce(ctx, cfg, true)
+		return connectOnce(ctx, cfg, target, password, true)
 	}
 }
 
-func joinConnectErrors(cfg *Config, errs ...error) error {
-	return fmt.Errorf("opengauss: connect to %s: %w", cfg, errors.Join(errs...))
-}
-
-func connectOnce(ctx context.Context, cfg *Config, useTLS bool) (*conn, error) {
-	netConn, err := dial(ctx, cfg)
+func connectOnce(ctx context.Context, cfg *Config, target Target, password string, useTLS bool) (*conn, error) {
+	netConn, err := dial(ctx, target)
 	if err != nil {
 		return nil, &stageError{stageDial, err}
 	}
 
 	c := &conn{
-		netConn: netConn,
-		br:      bufio.NewReader(netConn),
-		config:  cfg,
+		netConn:  netConn,
+		br:       bufio.NewReader(netConn),
+		config:   cfg,
+		target:   target,
+		password: password,
 	}
 	connected := false
 	defer func() {
@@ -151,9 +181,9 @@ func connectOnce(ctx context.Context, cfg *Config, useTLS bool) (*conn, error) {
 	return c, nil
 }
 
-func dial(ctx context.Context, cfg *Config) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: cfg.ConnectTimeout}
-	address := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+func dial(ctx context.Context, target Target) (net.Conn, error) {
+	dialer := net.Dialer{}
+	address := target.String()
 	netConn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -178,19 +208,16 @@ func contextCause(ctx context.Context) error {
 }
 
 // setStartupDeadline bounds the whole startup handshake by the caller's
-// deadline and by connect_timeout, whichever ends first.
+// deadline, which connectTarget already restricted to connect_timeout.
 func (c *conn) setStartupDeadline(ctx context.Context) error {
-	var deadline time.Time
-	if c.config.ConnectTimeout > 0 {
-		deadline = time.Now().Add(c.config.ConnectTimeout)
-	}
-	if ctxDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || ctxDeadline.Before(deadline)) {
-		deadline = ctxDeadline
-	}
-	if deadline.IsZero() {
+	deadline, ok := ctx.Deadline()
+	if !ok {
 		return nil
 	}
-	return c.netConn.SetDeadline(deadline)
+	if err := c.netConn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	return nil
 }
 
 // negotiateTLS performs the SSLRequest exchange and upgrades the connection.
@@ -209,10 +236,13 @@ func (c *conn) negotiateTLS(ctx context.Context) error {
 	}
 	switch response[0] {
 	case 'S':
-		tlsCfg := c.config.tlsConfig
-		if tlsCfg == nil {
+		if c.config.tlsConfig == nil {
 			return errors.New("TLS configuration is missing")
 		}
+		// The DNS name belongs to the endpoint actually dialed, which differs
+		// between targets.
+		tlsCfg := c.config.tlsConfig.Clone()
+		tlsCfg.ServerName = c.target.Host
 		tlsConn := tls.Client(c.netConn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -271,7 +301,7 @@ func (c *conn) startup(ctx context.Context) error {
 			if r.Err != nil {
 				return &stageError{stageAuthentication, r.Err}
 			}
-			payload, authErr := auth.Response(code, r, c.config.User, c.config.Password)
+			payload, authErr := auth.Response(code, r, c.config.User, c.password)
 			if authErr != nil {
 				return &stageError{stageAuthentication, authErr}
 			}

@@ -33,11 +33,25 @@ func (m SSLMode) valid() bool {
 	return false
 }
 
+// Target is one TCP endpoint. A connector tries its targets in order.
+type Target struct {
+	Host string
+	Port int
+}
+
+// String formats the target as host:port for errors and logs.
+func (t Target) String() string {
+	return net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
+}
+
 // Config is the immutable set of connection settings parsed from a DSN.
 // A Connector shares one Config between every physical connection it opens.
 type Config struct {
+	// Host and Port are the first entry of Targets, kept for the common
+	// single-endpoint case.
 	Host           string
 	Port           int
+	Targets        []Target
 	User           string
 	Password       string
 	Database       string
@@ -47,16 +61,39 @@ type Config struct {
 	SSLClientKey   string
 	ConnectTimeout time.Duration
 
+	// passfile and passfileExplicit remember where a missing password may be
+	// resolved, so each target can be matched against its own entry.
+	passfile         string
+	passfileExplicit bool
+
+	// passwordSet records that the application supplied the password, which
+	// therefore applies to every target instead of being looked up per host.
+	passwordSet bool
+
 	// tlsConfig is prepared once by NewConnector, so certificate files are
 	// validated before any connection attempt. It is nil for sslmode=disable.
 	tlsConfig *tls.Config
 }
 
-// String returns a description of the endpoint with the password removed. It
+// String returns a description of the endpoints with the password removed. It
 // is safe to include in logs and errors.
 func (c *Config) String() string {
+	endpoints := make([]string, len(c.Targets))
+	for i, target := range c.Targets {
+		endpoints[i] = target.String()
+	}
 	return fmt.Sprintf("opengauss://%s@%s/%s?sslmode=%s",
-		c.User, net.JoinHostPort(c.Host, strconv.Itoa(c.Port)), c.Database, c.SSLMode)
+		c.User, strings.Join(endpoints, ","), c.Database, c.SSLMode)
+}
+
+// passwordForTarget resolves the password to use against one endpoint. An
+// explicitly supplied password applies to every target; otherwise the passfile
+// is resolved per host/port pair, as libpq does.
+func (c *Config) passwordForTarget(target Target) (string, error) {
+	if c.passwordSet {
+		return c.Password, nil
+	}
+	return lookupPassfile(c.passfile, c.passfileExplicit, target, c.Database, c.User)
 }
 
 const defaultPort = 5432
@@ -96,8 +133,12 @@ func parseConfig(dsn string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Password == "" {
-		password, err := lookupPassfile(passfile, passfileSet && passfile != "", cfg)
+	cfg.passfile = passfile
+	cfg.passfileExplicit = passfileSet && passfile != ""
+	if !cfg.passwordSet {
+		// Resolve the first target now so local configuration errors surface
+		// at construction; each target still resolves its own entry.
+		password, err := lookupPassfile(cfg.passfile, cfg.passfileExplicit, cfg.Targets[0], cfg.Database, cfg.User)
 		if err != nil {
 			return nil, err
 		}
@@ -223,51 +264,59 @@ func parseKeywordDSN(dsn string) (map[string]string, error) {
 	return values, nil
 }
 
-// parseURLDSN parses a postgres://, postgresql:// or opengauss:// URL with a
-// single host.
+// parseURLDSN parses a postgres://, postgresql:// or opengauss:// URL. The
+// authority may hold a comma-separated host list, which net/url cannot parse,
+// so the authority is split here and the remainder is parsed by the standard
+// library.
 func parseURLDSN(dsn string) (map[string]string, error) {
 	schemeEnd := strings.Index(dsn, "://")
 	if schemeEnd <= 0 {
 		return nil, errors.New("opengauss: invalid URL DSN: missing scheme")
 	}
-	// Reject multi-host authorities before url.Parse sees them, because a
-	// comma-separated host is not a valid single authority.
-	rest := dsn[schemeEnd+3:]
-	authority := rest
-	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
-		authority = rest[:end]
-	}
-	if strings.Contains(authority, ",") {
-		return nil, errors.New("opengauss: multi-host DSNs are not supported yet: use a single host and port")
-	}
-
-	u, err := url.Parse(dsn)
-	if err != nil {
-		// url.Error embeds the raw DSN, which may contain the password.
-		var urlErr *url.Error
-		if errors.As(err, &urlErr) {
-			err = urlErr.Err
-		}
-		return nil, fmt.Errorf("opengauss: invalid URL DSN: %w", err)
-	}
-	switch u.Scheme {
+	scheme := dsn[:schemeEnd]
+	switch scheme {
 	case "postgres", "postgresql", "opengauss":
 	default:
-		return nil, fmt.Errorf("opengauss: unsupported DSN scheme %q: use postgres:// or opengauss://", u.Scheme)
+		return nil, fmt.Errorf("opengauss: unsupported DSN scheme %q: use postgres:// or opengauss://", scheme)
+	}
+
+	rest := dsn[schemeEnd+3:]
+	authority, tail := rest, ""
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		authority, tail = rest[:i], rest[i:]
+	}
+	userinfo, hostList := "", authority
+	if i := strings.LastIndex(authority, "@"); i >= 0 {
+		userinfo, hostList = authority[:i], authority[i+1:]
 	}
 
 	values := make(map[string]string)
-	if host := u.Hostname(); host != "" {
-		values["host"] = host
-	}
-	if port := u.Port(); port != "" {
-		values["port"] = port
-	}
-	if u.User != nil {
-		values["user"] = u.User.Username()
-		if password, ok := u.User.Password(); ok {
+	if userinfo != "" {
+		user, password, hasPassword, err := parseURLUserinfo(userinfo)
+		if err != nil {
+			return nil, err
+		}
+		values["user"] = user
+		if hasPassword {
 			values["password"] = password
 		}
+	}
+	if hostList != "" {
+		hosts, ports, anyPort, err := parseURLHostList(hostList)
+		if err != nil {
+			return nil, err
+		}
+		values["host"] = strings.Join(hosts, ",")
+		// Without an explicit port the default applies, and a port given in
+		// the query string must still be accepted.
+		if anyPort {
+			values["port"] = strings.Join(ports, ",")
+		}
+	}
+
+	u, err := url.Parse("opengauss://host" + tail)
+	if err != nil {
+		return nil, errors.New("opengauss: invalid URL DSN: the path or query is malformed")
 	}
 	if dbname := strings.TrimPrefix(u.Path, "/"); dbname != "" {
 		if strings.Contains(dbname, "/") {
@@ -293,12 +342,77 @@ func parseURLDSN(dsn string) (map[string]string, error) {
 	return values, nil
 }
 
+// parseURLUserinfo splits and decodes "user[:password]". Error messages never
+// echo the decoded text, which may contain a password.
+func parseURLUserinfo(userinfo string) (user, password string, hasPassword bool, err error) {
+	userPart, passwordPart, hasPassword := strings.Cut(userinfo, ":")
+	user, err = url.PathUnescape(userPart)
+	if err != nil {
+		return "", "", false, errors.New("opengauss: invalid URL DSN: the user is not valid percent-encoded text")
+	}
+	if !hasPassword {
+		return user, "", false, nil
+	}
+	password, err = url.PathUnescape(passwordPart)
+	if err != nil {
+		return "", "", false, errors.New("opengauss: invalid URL DSN: the password is not valid percent-encoded text")
+	}
+	return user, password, true, nil
+}
+
+// parseURLHostList splits a URL host list such as "db1:5432,db2". Hosts
+// without a port receive the default port; anyPort reports whether the list
+// named a port at all.
+func parseURLHostList(raw string) (hosts, ports []string, anyPort bool, err error) {
+	endpoints := strings.Split(raw, ",")
+	hosts = make([]string, 0, len(endpoints))
+	ports = make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		host, port, hasPort, err := splitEndpoint(endpoint)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("opengauss: invalid URL DSN: %w", err)
+		}
+		if host == "" {
+			return nil, nil, false, errors.New("opengauss: invalid URL DSN: empty host in the host list")
+		}
+		if hasPort {
+			anyPort = true
+		} else {
+			port = strconv.Itoa(defaultPort)
+		}
+		hosts = append(hosts, host)
+		ports = append(ports, port)
+	}
+	return hosts, ports, anyPort, nil
+}
+
+// splitEndpoint splits one host[:port] entry, understanding [IPv6] brackets.
+func splitEndpoint(endpoint string) (host, port string, hasPort bool, err error) {
+	if strings.HasPrefix(endpoint, "[") {
+		end := strings.Index(endpoint, "]")
+		if end < 0 {
+			return "", "", false, fmt.Errorf("unterminated IPv6 address %q", endpoint)
+		}
+		host = endpoint[1:end]
+		rest := endpoint[end+1:]
+		if rest == "" {
+			return host, "", false, nil
+		}
+		if !strings.HasPrefix(rest, ":") {
+			return "", "", false, fmt.Errorf("invalid host %q", endpoint)
+		}
+		return host, rest[1:], true, nil
+	}
+	if i := strings.LastIndex(endpoint, ":"); i >= 0 {
+		return endpoint[:i], endpoint[i+1:], true, nil
+	}
+	return endpoint, "", false, nil
+}
+
 // newConfig validates the parsed parameter set. Explicit settings are
 // authoritative; only host, port, database name and sslmode have defaults.
 func newConfig(values map[string]string) (*Config, error) {
 	cfg := &Config{
-		Host:    "localhost",
-		Port:    defaultPort,
 		SSLMode: SSLModePrefer,
 	}
 	for key, value := range values {
@@ -306,21 +420,13 @@ func newConfig(values map[string]string) (*Config, error) {
 			return nil, fmt.Errorf("opengauss: connection parameter %q contains a NUL byte", key)
 		}
 		switch key {
-		case "host":
-			if value == "" {
-				return nil, errors.New("opengauss: host must not be empty")
-			}
-			cfg.Host = value
-		case "port":
-			port, err := strconv.Atoi(value)
-			if err != nil || port < 1 || port > 65535 {
-				return nil, fmt.Errorf("opengauss: invalid port %q: must be an integer between 1 and 65535", value)
-			}
-			cfg.Port = port
+		case "host", "port":
+			// Expanded into Targets after the loop.
 		case "user":
 			cfg.User = value
 		case "password":
 			cfg.Password = value
+			cfg.passwordSet = true
 		case "dbname", "database":
 			if cfg.Database != "" && cfg.Database != value {
 				return nil, errors.New("opengauss: dbname and database are both specified with different values")
@@ -355,6 +461,12 @@ func newConfig(values map[string]string) (*Config, error) {
 	if cfg.User == "" {
 		return nil, errors.New("opengauss: missing the required user parameter: set user in the DSN, PGUSER in the environment or a service file")
 	}
+	targets, err := parseTargets(values["host"], presence(values, "host"), values["port"], presence(values, "port"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Targets = targets
+	cfg.Host, cfg.Port = targets[0].Host, targets[0].Port
 	if (cfg.SSLClientCert == "") != (cfg.SSLClientKey == "") && cfg.SSLMode != SSLModeDisable {
 		return nil, errors.New("opengauss: sslcert and sslkey must be specified together")
 	}
@@ -362,6 +474,63 @@ func newConfig(values map[string]string) (*Config, error) {
 		cfg.Database = cfg.User
 	}
 	return cfg, nil
+}
+
+// presence reports whether values contains key, which distinguishes an
+// omitted parameter from an explicitly empty one.
+func presence(values map[string]string, key string) bool {
+	_, ok := values[key]
+	return ok
+}
+
+// parseTargets expands the host and port lists into endpoints. One port
+// applies to every host; otherwise the lists must have the same length.
+func parseTargets(hostValue string, hostSet bool, portValue string, portSet bool) ([]Target, error) {
+	hosts := []string{"localhost"}
+	if hostSet {
+		if hostValue == "" {
+			return nil, errors.New("opengauss: host must not be empty")
+		}
+		hosts = strings.Split(hostValue, ",")
+		for _, host := range hosts {
+			if host == "" {
+				return nil, errors.New("opengauss: the host list contains an empty entry")
+			}
+			if strings.ContainsAny(host, " \t\n\r\v\f") {
+				return nil, fmt.Errorf("opengauss: invalid host %q: it contains whitespace", host)
+			}
+		}
+	}
+	ports := make([]int, len(hosts))
+	for i := range ports {
+		ports[i] = defaultPort
+	}
+	if portSet {
+		parts := strings.Split(portValue, ",")
+		parsed := make([]int, len(parts))
+		for i, part := range parts {
+			port, err := strconv.Atoi(part)
+			if err != nil || port < 1 || port > 65535 {
+				return nil, fmt.Errorf("opengauss: invalid port %q: must be an integer between 1 and 65535", part)
+			}
+			parsed[i] = port
+		}
+		switch len(parsed) {
+		case 1:
+			for i := range ports {
+				ports[i] = parsed[0]
+			}
+		case len(hosts):
+			copy(ports, parsed)
+		default:
+			return nil, fmt.Errorf("opengauss: the port list has %d entries but the host list has %d", len(parsed), len(hosts))
+		}
+	}
+	targets := make([]Target, len(hosts))
+	for i := range hosts {
+		targets[i] = Target{Host: hosts[i], Port: ports[i]}
+	}
+	return targets, nil
 }
 
 func isSpace(c byte) bool {
