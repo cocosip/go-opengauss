@@ -883,3 +883,26 @@ func TestCopyInUsesServerRowWidth(t *testing.T) {
 		t.Errorf("rows = %q", rows)
 	}
 }
+
+// TestUnexpectedCopyResponseIsRefused covers a server that answers a normal
+// statement with a COPY stream: the driver must refuse the stream and discard
+// the session instead of pretending to read a result or leaking the stream into
+// the next user of the pooled connection.
+func TestUnexpectedCopyResponseIsRefused(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if got := s.expectSimpleQuery(); got != "SELECT 1" {
+			s.fail("query = %q, want SELECT 1", got)
+		}
+		// A protocol surprise: the server starts COPY IN for a SELECT.
+		s.sendCopyInResponse(0, 1)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	if _, err := db.ExecContext(testContext(t), "SELECT 1"); !errors.Is(err, errCopyInRequired) {
+		t.Fatalf("ExecContext error = %v, want errCopyInRequired", err)
+	}
+	if idle := db.Stats().Idle; idle != 0 {
+		t.Errorf("idle connections = %d, want 0 because the session must be discarded", idle)
+	}
+}
