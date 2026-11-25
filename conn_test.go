@@ -1887,6 +1887,88 @@ func TestTypedResultValues(t *testing.T) {
 	}
 }
 
+// TestUnmappedTypesStayText pins the documented type contract: arrays, UUID,
+// JSONB and user-defined types keep the server's text verbatim instead of being
+// guessed into a Go value.
+func TestUnmappedTypesStayText(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		if query := s.expectSimpleQuery(); query != "SELECT unmapped" {
+			s.fail("query = %q", query)
+		}
+		s.sendRowDescription(
+			fakeColumn{name: "arr", oid: 1007},     // int4[]
+			fakeColumn{name: "multi", oid: 1009},   // text[]
+			fakeColumn{name: "id", oid: 2950},      // uuid
+			fakeColumn{name: "doc", oid: 3802},     // jsonb
+			fakeColumn{name: "mood", oid: 20000},   // a user-defined enum
+			fakeColumn{name: "domain", oid: 16401}, // a domain over text
+		)
+		s.sendDataRow(
+			"{1,2,NULL}",
+			`{"a","b,c",NULL}`,
+			"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+			`{"k": "v", "n": 1}`,
+			"happy",
+			"domain value",
+		)
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	rows, err := db.QueryContext(testContext(t), "SELECT unmapped")
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		t.Fatalf("ColumnTypes: %v", err)
+	}
+	for i, columnType := range types {
+		// Only the curated type table names an OID; a type outside it reports
+		// no name, but every one of these columns still scans as text.
+		if got := columnType.ScanType(); got != reflect.TypeOf("") {
+			t.Errorf("ScanType(%d) = %v, want string", i, got)
+		}
+	}
+	if name := types[2].DatabaseTypeName(); name != "uuid" {
+		t.Errorf("DatabaseTypeName(uuid) = %q", name)
+	}
+	if name := types[3].DatabaseTypeName(); name != "jsonb" {
+		t.Errorf("DatabaseTypeName(jsonb) = %q", name)
+	}
+	if name := types[0].DatabaseTypeName(); name != "" {
+		t.Errorf("DatabaseTypeName(array) = %q, want no name for an OID outside the table", name)
+	}
+
+	wantValues := []string{
+		"{1,2,NULL}",
+		`{"a","b,c",NULL}`,
+		"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+		`{"k": "v", "n": 1}`,
+		"happy",
+		"domain value",
+	}
+
+	if !rows.Next() {
+		t.Fatalf("Next: %v", rows.Err())
+	}
+	var values [6]string
+	dest := []any{&values[0], &values[1], &values[2], &values[3], &values[4], &values[5]}
+	if err := rows.Scan(dest...); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	for i, want := range wantValues {
+		if values[i] != want {
+			t.Errorf("value %d = %q, want %q", i, values[i], want)
+		}
+	}
+}
+
 func TestByteaParameterIsText(t *testing.T) {
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)
