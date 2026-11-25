@@ -160,26 +160,7 @@ func TestPreparedStatementExec(t *testing.T) {
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)
 
-		name, query := s.expectPrepare()
-		if query != "INSERT INTO t VALUES ($1)" {
-			s.fail("prepared query = %q", query)
-		}
-		if name == "" {
-			s.fail("prepared statement name is empty")
-		}
-		describe := s.expectType(proto.MsgDescribe)
-		dr := &proto.ReadBuf{B: describe}
-		if target := dr.Byte(); target != 'S' {
-			s.fail("Describe target = %q, want statement", target)
-		}
-		if described := dr.String(); described != name {
-			s.fail("described statement = %q, want %q", described, name)
-		}
-		s.expectType(proto.MsgSync)
-		s.sendParseComplete()
-		s.sendParameterDescription(23)
-		s.sendNoData()
-		s.sendReady(proto.TxnIdle)
+		name := prepareStatement(t, s, "INSERT INTO t VALUES ($1)", 23)
 
 		statement, args := s.expectBindExecute()
 		if statement != name {
@@ -193,16 +174,7 @@ func TestPreparedStatementExec(t *testing.T) {
 		s.sendCommandComplete("INSERT 0 1")
 		s.sendReady(proto.TxnIdle)
 
-		closeBody := s.expectType(proto.MsgClose)
-		closer := &proto.ReadBuf{B: closeBody}
-		if target := closer.Byte(); target != 'S' {
-			s.fail("Close target = %q, want statement", target)
-		}
-		if closed := closer.String(); closed != name {
-			s.fail("closed statement = %q, want %q", closed, name)
-		}
-		s.sendCloseComplete()
-		s.sendReady(proto.TxnIdle)
+		closeStatement(s, name)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))

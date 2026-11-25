@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
@@ -435,5 +436,189 @@ func TestLiveMultipleResultSets(t *testing.T) {
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("rows error: %v", err)
+	}
+}
+
+// TestLiveOfficialExamples runs the official openGauss Go guide's common
+// operations against a live server: DDL, a prepared insert loop, a prepared
+// update, row iteration, a scalar function, a manual transaction and a JSONB
+// round trip. Every object it creates carries a unique suffix and is dropped
+// again, so the DSN may point at a shared disposable database.
+func TestLiveOfficialExamples(t *testing.T) {
+	dsn := os.Getenv("OPENGAUSS_DSN")
+	if dsn == "" {
+		t.Skip("set OPENGAUSS_DSN to run against a live openGauss server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	defer func() { _ = db.Close() }()
+	// Cleanup must not block on a lock held by a failed test, so it uses a
+	// bounded context instead of an unbounded one.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cleanupCancel()
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	table := "customer_t1_" + suffix
+	jsonTable := "t_jsonb_" + suffix
+	funcName := "testproc_" + suffix
+	insertSQL := "INSERT INTO " + table + " (c_customer_sk, c_customer_name) VALUES ($1, $2)"
+
+	if _, err := db.ExecContext(ctx, "CREATE TABLE "+table+" (c_customer_sk INTEGER, c_customer_name VARCHAR(32))"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	defer func() {
+		if _, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+table); err != nil {
+			t.Logf("drop %s: %v", table, err)
+		}
+	}()
+
+	stmt, err := db.PrepareContext(ctx, insertSQL)
+	if err != nil {
+		t.Fatalf("PrepareContext: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := stmt.ExecContext(ctx, i, fmt.Sprintf("data %d", i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatalf("stmt.Close: %v", err)
+	}
+
+	res, err := db.ExecContext(ctx, "UPDATE "+table+" SET c_customer_name = $1 WHERE c_customer_sk = $2", "new Data", 1)
+	if err != nil {
+		t.Fatalf("UPDATE: %v", err)
+	}
+	if affected, err := res.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("UPDATE RowsAffected = %d, %v; want 1, nil", affected, err)
+	}
+
+	rows, err := db.QueryContext(ctx, "SELECT c_customer_sk, c_customer_name FROM "+table+" ORDER BY c_customer_sk")
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	wantNames := []string{"data 0", "new Data", "data 2"}
+	var index int
+	for rows.Next() {
+		var sk int
+		var name string
+		if err := rows.Scan(&sk, &name); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		if sk != index || name != wantNames[index] {
+			t.Fatalf("row %d = %d/%q, want %d/%q", index, sk, name, index, wantNames[index])
+		}
+		index++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows error: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("rows close: %v", err)
+	}
+	if index != len(wantNames) {
+		t.Fatalf("read %d rows, want %d", index, len(wantNames))
+	}
+
+	createFunction := "CREATE OR REPLACE FUNCTION " + funcName + "(a int, b int, c int) RETURNS int " +
+		"AS $$ BEGIN RETURN a + b + c; END; $$ LANGUAGE plpgsql"
+	if _, err := db.ExecContext(ctx, createFunction); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	defer func() {
+		if _, err := db.ExecContext(cleanupCtx, "DROP FUNCTION IF EXISTS "+funcName+"(int, int, int)"); err != nil {
+			t.Logf("drop function %s: %v", funcName, err)
+		}
+	}()
+	var sum int
+	if err := db.QueryRowContext(ctx, "SELECT "+funcName+"($1, $2, $3)", 20, 50, 90).Scan(&sum); err != nil {
+		t.Fatalf("call function: %v", err)
+	}
+	if sum != 160 {
+		t.Errorf("function result = %d, want 160", sum)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	// A failure before Commit or Rollback must not leave the transaction open,
+	// because the deferred drops below would then wait on its locks.
+	defer func(tx *sql.Tx) { _ = tx.Rollback() }(tx)
+	if _, err := tx.ExecContext(ctx, insertSQL, 100, "tx-data"); err != nil {
+		t.Fatalf("tx insert: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE "+table+" SET c_customer_name = $1 WHERE c_customer_sk = $2", "tx-updated", 100); err != nil {
+		t.Fatalf("tx update: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	var updated string
+	if err := db.QueryRowContext(ctx, "SELECT c_customer_name FROM "+table+" WHERE c_customer_sk = 100").Scan(&updated); err != nil {
+		t.Fatalf("read committed row: %v", err)
+	}
+	if updated != "tx-updated" {
+		t.Errorf("committed name = %q, want tx-updated", updated)
+	}
+
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx (rollback): %v", err)
+	}
+	defer func(tx *sql.Tx) { _ = tx.Rollback() }(tx)
+	if _, err := tx.ExecContext(ctx, insertSQL, 200, "rolled-back"); err != nil {
+		t.Fatalf("rollback insert: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	var rolledBack int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM "+table+" WHERE c_customer_sk = 200").Scan(&rolledBack); err != nil {
+		t.Fatalf("count rolled-back row: %v", err)
+	}
+	if rolledBack != 0 {
+		t.Errorf("rolled-back rows = %d, want 0", rolledBack)
+	}
+
+	if _, err := db.ExecContext(ctx, "CREATE TABLE "+jsonTable+" (id serial PRIMARY KEY, data jsonb)"); err != nil {
+		t.Fatalf("CREATE JSONB TABLE: %v", err)
+	}
+	defer func() {
+		if _, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+jsonTable); err != nil {
+			t.Logf("drop %s: %v", jsonTable, err)
+		}
+	}()
+	document := `{"name":"Alice","age":30}`
+	if _, err := db.ExecContext(ctx, "INSERT INTO "+jsonTable+" (data) VALUES ($1)", document); err != nil {
+		t.Fatalf("JSONB insert: %v", err)
+	}
+	var raw string
+	if err := db.QueryRowContext(ctx, "SELECT data FROM "+jsonTable).Scan(&raw); err != nil {
+		t.Fatalf("JSONB select: %v", err)
+	}
+	var decoded struct {
+		Name string `json:"name"`
+		Age  int    `json:"age"`
+	}
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		t.Fatalf("Unmarshal(%q): %v", raw, err)
+	}
+	if decoded.Name != "Alice" || decoded.Age != 30 {
+		t.Errorf("decoded payload = %+v, want Alice/30", decoded)
+	}
+	var id int
+	if err := db.QueryRowContext(ctx, "INSERT INTO "+jsonTable+" (data) VALUES ($1) RETURNING id", document).Scan(&id); err != nil {
+		t.Fatalf("JSONB RETURNING: %v", err)
+	}
+	if id != 2 {
+		t.Errorf("returned id = %d, want 2", id)
 	}
 }
