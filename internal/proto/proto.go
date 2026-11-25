@@ -55,6 +55,9 @@ const (
 	// openGauss releases declare in src/include/libpq/pqcomm.h.
 	ProtocolVersion351 int32 = 196659
 	SSLRequestCode     int32 = 80877103
+	// CancelRequestCode asks the server to abort the statement running on the
+	// backend identified by the request's process ID and secret key.
+	CancelRequestCode int32 = 80877102
 
 	// MaxMessageSize bounds allocations caused by a corrupt or hostile length
 	// field. Large column values still fit comfortably.

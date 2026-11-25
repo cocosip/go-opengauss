@@ -803,6 +803,258 @@ func TestRowStreamingHonorsContextDeadline(t *testing.T) {
 	}
 }
 
+func TestInterruptedOperationDiscardsSession(t *testing.T) {
+	// An operation interrupted by its context never read the reply, so the
+	// session may still hold a pending result and must not be reused.
+	physical := &conn{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := physical.wrapIOError(ctx, "exec", errors.New("read failed"))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if !physical.bad {
+		t.Error("the interrupted session was not marked bad")
+	}
+}
+
+func TestCancelRequestAbortsStatementAndKeepsSession(t *testing.T) {
+	queryReceived := make(chan struct{})
+	var server *fakeServer
+	server = newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		if query := s.expectSimpleQuery(); query != "UPDATE slow" {
+			s.fail("query = %q", query)
+		}
+		close(queryReceived)
+
+		// The cancellation arrives on a separate connection and names this
+		// backend, so the server can abort exactly this statement.
+		record := server.waitCancel(t)
+		if record.pid != 4242 || record.key != 9001 {
+			s.fail("cancel identity = pid %d key %d, want 4242/9001", record.pid, record.key)
+		}
+		s.sendError("57014", "canceling statement due to user request")
+		s.sendReady(proto.TxnIdle)
+
+		// The synchronized session must serve the next statement instead of
+		// being discarded.
+		if query := s.expectSimpleQuery(); query != "" {
+			s.fail("reuse query = %q", query)
+		}
+		s.sendEmptyQueryResponse()
+		s.sendReady(proto.TxnIdle)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-queryReceived
+		cancel()
+	}()
+
+	// Exec observes the server error directly, so the SQLSTATE is deterministic
+	// here; Rows may instead report the caller's context error through
+	// database/sql.
+	_, err := db.ExecContext(ctx, "UPDATE slow")
+	var serverErr *Error
+	if !errors.As(err, &serverErr) {
+		t.Fatalf("ExecContext = %v, want the server's cancellation error", err)
+	}
+	if serverErr.SQLState() != "57014" {
+		t.Errorf("SQLState = %q, want 57014", serverErr.SQLState())
+	}
+
+	if err := db.PingContext(testContext(t)); err != nil {
+		t.Fatalf("reuse the session after cancellation: %v", err)
+	}
+	if got := server.connections(); got != 1 {
+		t.Errorf("connections = %d, want 1: the session should have been reused", got)
+	}
+}
+
+func TestCancelDuringRowStreamingKeepsSession(t *testing.T) {
+	queryReceived := make(chan struct{})
+	var server *fakeServer
+	server = newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		if query := s.expectSimpleQuery(); query != "SELECT slow" {
+			s.fail("query = %q", query)
+		}
+		s.sendRowDescription(fakeColumn{name: "n", oid: 20})
+		s.sendDataRow("1")
+		close(queryReceived)
+
+		record := server.waitCancel(t)
+		if record.pid != 4242 || record.key != 9001 {
+			s.fail("cancel identity = pid %d key %d, want 4242/9001", record.pid, record.key)
+		}
+		s.sendError("57014", "canceling statement due to user request")
+		s.sendReady(proto.TxnIdle)
+
+		if query := s.expectSimpleQuery(); query != "" {
+			s.fail("reuse query = %q", query)
+		}
+		s.sendEmptyQueryResponse()
+		s.sendReady(proto.TxnIdle)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result, err := db.QueryContext(ctx, "SELECT slow")
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	if !result.Next() {
+		t.Fatalf("first row: %v", result.Err())
+	}
+
+	go func() {
+		<-queryReceived
+		cancel()
+	}()
+	// database/sql may either surface the server's cancellation error or the
+	// context error it observed itself; both are legitimate.
+	if result.Next() {
+		t.Fatal("Next returned a row from a canceled statement")
+	}
+	err = result.Err()
+	var serverErr *Error
+	if !errors.As(err, &serverErr) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("rows.Err() = %v, want the cancellation", err)
+	}
+	if errors.As(err, &serverErr) && serverErr.SQLState() != "57014" {
+		t.Errorf("SQLState = %q, want 57014", serverErr.SQLState())
+	}
+	if err := result.Close(); err != nil {
+		t.Errorf("Close after cancellation: %v", err)
+	}
+
+	if err := db.PingContext(testContext(t)); err != nil {
+		t.Fatalf("reuse the session after cancellation: %v", err)
+	}
+	if got := server.connections(); got != 1 {
+		t.Errorf("connections = %d, want 1: the session should have been reused", got)
+	}
+}
+
+func TestCancelWaitsForServerAcknowledgement(t *testing.T) {
+	queryReceived := make(chan struct{})
+	var server *fakeServer
+	server = newFakeServerWithCancelHold(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		if query := s.expectSimpleQuery(); query != "UPDATE slow" {
+			s.fail("query = %q", query)
+		}
+		close(queryReceived)
+
+		server.waitCancel(t)
+		// Answer the statement at once, but keep the cancel connection open,
+		// so only a client that waits for the acknowledgement stays ordered.
+		s.sendError("57014", "canceling statement due to user request")
+		s.sendReady(proto.TxnIdle)
+	}, 300*time.Millisecond)
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-queryReceived
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := db.ExecContext(ctx, "UPDATE slow")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected the canceled statement to fail")
+	}
+	if elapsed < 250*time.Millisecond {
+		t.Errorf("Exec returned after %v, before the postmaster acknowledged the cancel", elapsed)
+	}
+}
+
+func TestCancelWithoutServerAcknowledgementDiscardsSession(t *testing.T) {
+	queryReceived := make(chan struct{})
+	// release keeps the canceled session open until the test ends, so only the
+	// client's own deadline can end the operation.
+	release := make(chan struct{})
+	var (
+		mu      sync.Mutex
+		handled int
+	)
+	var server *fakeServer
+	server = newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		mu.Lock()
+		handled++
+		current := handled
+		mu.Unlock()
+		if current > 1 {
+			// The discarded session was replaced by a fresh connection.
+			if query := s.expectSimpleQuery(); query != "" {
+				s.fail("replacement query = %q", query)
+			}
+			s.sendEmptyQueryResponse()
+			s.sendReady(proto.TxnIdle)
+			return
+		}
+
+		if query := s.expectSimpleQuery(); query != "UPDATE slow" {
+			s.fail("query = %q", query)
+		}
+		close(queryReceived)
+
+		// Accept the cancel request but never answer the statement.
+		server.waitCancel(t)
+		<-release
+	})
+	// Registered after the server so it runs before the server's cleanup, which
+	// waits for this handler.
+	t.Cleanup(func() { close(release) })
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-queryReceived
+		cancel()
+	}()
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(ctx, "UPDATE slow")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("cancellation took %v, want the cancel grace bound", elapsed)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("ExecContext = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ExecContext did not return after the cancel grace period")
+	}
+
+	if err := db.PingContext(testContext(t)); err != nil {
+		t.Fatalf("ping after the unanswered cancel: %v", err)
+	}
+	if got := server.connections(); got != 2 {
+		t.Errorf("connections = %d, want 2: the unacknowledged session must be discarded", got)
+	}
+}
 func TestCommitReportsServerRollback(t *testing.T) {
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)

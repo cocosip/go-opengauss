@@ -183,7 +183,7 @@ func connectOnce(ctx context.Context, cfg *Config, target Target, password strin
 		}
 	}()
 
-	watcher := watchCancellation(ctx, netConn)
+	watcher := c.watchCancellation(ctx, false)
 	defer watcher.stop()
 
 	if err := c.setStartupDeadline(ctx); err != nil {
@@ -419,22 +419,38 @@ func (c *conn) setTxnStatus(body []byte) {
 	}
 }
 
-// cancelWatcher interrupts in-flight I/O when the caller's context ends. The
-// protocol state is unknown after an interruption, so the caller marks the
-// connection bad. A nil watcher means the context cannot be canceled.
+// cancelGrace bounds how long an interrupted operation waits for the server to
+// acknowledge a CancelRequest. If no answer arrives the socket deadline forces
+// the read to fail, and the caller discards the unsynchronized session.
+const cancelGrace = time.Second
+
+// cancelWatcher interrupts in-flight I/O when the caller's context ends. For an
+// operation it first asks the server to abort the running statement on a
+// separate connection, so a cooperative server answers with an error and the
+// session stays synchronized. A nil watcher means the context cannot be
+// canceled.
 type cancelWatcher struct {
+	conn    *conn
 	netConn net.Conn
 	done    chan struct{}
 	exited  chan struct{}
 	once    sync.Once
+
+	// cancelSent and cancelConfirmed are written by the watcher goroutine
+	// before it closes exited, and read by endOperation afterwards.
+	cancelSent      bool
+	cancelConfirmed bool
 }
 
-func watchCancellation(ctx context.Context, netConn net.Conn) *cancelWatcher {
+// watchCancellation starts the watcher. requestCancel selects the CancelRequest
+// exchange, which is only meaningful once a backend key is known.
+func (c *conn) watchCancellation(ctx context.Context, requestCancel bool) *cancelWatcher {
 	if ctx.Done() == nil {
 		return nil
 	}
 	watcher := &cancelWatcher{
-		netConn: netConn,
+		conn:    c,
+		netConn: c.netConn,
 		done:    make(chan struct{}),
 		exited:  make(chan struct{}),
 	}
@@ -442,11 +458,65 @@ func watchCancellation(ctx context.Context, netConn net.Conn) *cancelWatcher {
 		defer close(watcher.exited)
 		select {
 		case <-ctx.Done():
-			_ = netConn.SetDeadline(time.Now())
+			if !requestCancel {
+				// During startup there is no backend to cancel, so interrupt
+				// the handshake immediately.
+				_ = watcher.netConn.SetDeadline(time.Now())
+				return
+			}
+			// Bound the pending read before the cancel exchange, so a slow
+			// cancel cannot delay the caller past the grace period.
+			_ = watcher.netConn.SetDeadline(time.Now().Add(cancelGrace))
+			watcher.cancelSent = true
+			watcher.cancelConfirmed = c.sendCancelRequest()
 		case <-watcher.done:
 		}
 	}()
 	return watcher
+}
+
+// sendCancelRequest asks the server to abort the statement running on this
+// backend and reports whether the postmaster confirmed the request by closing
+// the cancel connection. Every failure is ignored: the interrupted operation
+// still fails locally through the socket deadline.
+func (c *conn) sendCancelRequest() bool {
+	if c.backendPID == 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cancelGrace)
+	defer cancel()
+
+	// Cancel the exact peer this session is connected to. Re-resolving the
+	// host name could reach a different server where the key means nothing.
+	address := ""
+	if remote := c.netConn.RemoteAddr(); remote != nil {
+		address = remote.String()
+	}
+	var dialer net.Dialer
+	netConn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = netConn.Close() }()
+	if err := netConn.SetDeadline(time.Now().Add(cancelGrace)); err != nil {
+		return false
+	}
+
+	request := make([]byte, 16)
+	binary.BigEndian.PutUint32(request[0:4], 16)
+	binary.BigEndian.PutUint32(request[4:8], uint32(proto.CancelRequestCode))
+	binary.BigEndian.PutUint32(request[8:12], uint32(c.backendPID))
+	binary.BigEndian.PutUint32(request[12:16], uint32(c.backendKey))
+	if _, err := netConn.Write(request); err != nil {
+		return false
+	}
+	// The postmaster closes the connection once it has processed the request.
+	// Waiting for that end of file confirms the cancel cannot still abort a
+	// later statement on this session.
+	if _, err := io.Copy(io.Discard, netConn); err != nil {
+		return false
+	}
+	return true
 }
 
 // stop waits until the watcher goroutine has finished, so a deadline cleared
@@ -460,6 +530,9 @@ func (w *cancelWatcher) stop() {
 }
 
 func (c *conn) beginOperation(ctx context.Context) (*cancelWatcher, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.bad {
 		return nil, driver.ErrBadConn
 	}
@@ -469,11 +542,16 @@ func (c *conn) beginOperation(ctx context.Context) (*cancelWatcher, error) {
 			return nil, err
 		}
 	}
-	return watchCancellation(ctx, c.netConn), nil
+	return c.watchCancellation(ctx, true), nil
 }
 
 func (c *conn) endOperation(watcher *cancelWatcher) {
 	watcher.stop()
+	if !c.bad && watcher != nil && watcher.cancelSent && !watcher.cancelConfirmed {
+		// The postmaster never acknowledged the cancel, so it may still be
+		// delivered and abort a later statement on this session.
+		c.bad = true
+	}
 	if !c.bad {
 		_ = c.netConn.SetDeadline(time.Time{})
 	}
@@ -488,6 +566,9 @@ func (c *conn) wrapIOError(ctx context.Context, stage string, err error) error {
 		return err
 	}
 	if cause := contextCause(ctx); cause != nil {
+		// The reply was not consumed, so the session may hold a pending result
+		// and must not return to the pool.
+		c.bad = true
 		err = errors.Join(cause, err)
 	}
 	return &stageError{stage, err}

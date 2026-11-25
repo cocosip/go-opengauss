@@ -2,6 +2,7 @@ package opengauss
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Credentials used by the scripted peer. The password matches the published
@@ -27,21 +29,36 @@ const (
 
 // fakeServer is a scripted openGauss backend for offline protocol tests. Each
 // connection runs the same handler, which asserts the exact client messages.
+// CancelRequest connections are recognized before the handler and recorded.
 type fakeServer struct {
-	t        *testing.T
-	ln       net.Listener
-	handle   func(*fakeSession)
-	wg       sync.WaitGroup
-	accepted atomic.Int32
+	t          *testing.T
+	ln         net.Listener
+	handle     func(*fakeSession)
+	wg         sync.WaitGroup
+	accepted   atomic.Int32
+	cancels    chan cancelRecord
+	cancelHold time.Duration
+}
+
+// cancelRecord is the backend identity carried by a CancelRequest.
+type cancelRecord struct {
+	pid int32
+	key int32
 }
 
 func newFakeServer(t *testing.T, handle func(*fakeSession)) *fakeServer {
+	return newFakeServerWithCancelHold(t, handle, 0)
+}
+
+// newFakeServerWithCancelHold delays closing the cancel connection by hold, so
+// tests can observe the client waiting for the postmaster's acknowledgement.
+func newFakeServerWithCancelHold(t *testing.T, handle func(*fakeSession), hold time.Duration) *fakeServer {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	server := &fakeServer{t: t, ln: ln, handle: handle}
+	server := &fakeServer{t: t, ln: ln, handle: handle, cancels: make(chan cancelRecord, 8), cancelHold: hold}
 	server.wg.Add(1)
 	go server.serve()
 	t.Cleanup(server.close)
@@ -60,16 +77,63 @@ func (s *fakeServer) serve() {
 			return
 		}
 		s.wg.Add(1)
-		s.accepted.Add(1)
 		go func() {
 			defer s.wg.Done()
 			defer func() { _ = netConn.Close() }()
-			session := &fakeSession{t: s.t, netConn: netConn, br: bufio.NewReader(netConn)}
+			br := bufio.NewReader(netConn)
+
+			// The first eight bytes distinguish a CancelRequest from a
+			// startup packet; a cancel has no reply and no session.
+			first := make([]byte, 8)
+			if _, err := io.ReadFull(br, first); err != nil {
+				return
+			}
+			if int32(binary.BigEndian.Uint32(first[4:8])) == proto.CancelRequestCode {
+				if length := binary.BigEndian.Uint32(first[0:4]); length != 16 {
+					s.t.Errorf("fake peer: CancelRequest length = %d, want 16", length)
+					return
+				}
+				rest := make([]byte, 8)
+				if _, err := io.ReadFull(br, rest); err != nil {
+					return
+				}
+				select {
+				case s.cancels <- cancelRecord{
+					pid: int32(binary.BigEndian.Uint32(rest[0:4])),
+					key: int32(binary.BigEndian.Uint32(rest[4:8])),
+				}:
+				default:
+				}
+				if s.cancelHold > 0 {
+					time.Sleep(s.cancelHold)
+				}
+				return
+			}
+
+			s.accepted.Add(1)
+			session := &fakeSession{
+				t:       s.t,
+				netConn: netConn,
+				br:      bufio.NewReader(io.MultiReader(bytes.NewReader(first), br)),
+			}
 			s.handle(session)
 			if session.err != nil {
 				s.t.Errorf("fake peer: %v", session.err)
 			}
 		}()
+	}
+}
+
+// waitCancel returns the backend identity of the next CancelRequest, failing
+// the test when none arrives.
+func (s *fakeServer) waitCancel(t *testing.T) cancelRecord {
+	t.Helper()
+	select {
+	case record := <-s.cancels:
+		return record
+	case <-time.After(5 * time.Second):
+		t.Error("no CancelRequest arrived")
+		return cancelRecord{}
 	}
 }
 
