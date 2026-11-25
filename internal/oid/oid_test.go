@@ -108,6 +108,9 @@ func TestTypeName(t *testing.T) {
 		{Numeric, "numeric"},
 		{Text, "text"},
 		{Varchar, "varchar"},
+		{Bpchar, "bpchar"},
+		{Bit, "bit"},
+		{Varbit, "varbit"},
 		{Date, "date"},
 		{Timestamp, "timestamp"},
 		{TimestampTZ, "timestamptz"},
@@ -140,6 +143,59 @@ func TestScanType(t *testing.T) {
 	for _, tc := range tests {
 		if got := ScanType(tc.oid); got != tc.want {
 			t.Errorf("ScanType(%d) = %v, want %v", tc.oid, got, tc.want)
+		}
+	}
+}
+
+func TestColumnLength(t *testing.T) {
+	tests := []struct {
+		name   string
+		oid    int32
+		typmod int32
+		want   int64
+		ok     bool
+	}{
+		{"varchar(10)", Varchar, 14, 10, true},
+		{"char(3)", Bpchar, 7, 3, true},
+		{"bit(5)", Bit, 5, 5, true},
+		{"varbit(32)", Varbit, 32, 32, true},
+		{"varchar unbounded", Varchar, -1, 0, false},
+		{"bit unbounded", Bit, -1, 0, false},
+		{"text", Text, 14, 0, false},
+		{"numeric", Numeric, 4 + (12<<16 | 4), 0, false},
+	}
+	for _, tc := range tests {
+		got, ok := ColumnLength(tc.oid, tc.typmod)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("ColumnLength(%s) = %d, %v, want %d, %v", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestNumericPrecisionScale(t *testing.T) {
+	tests := []struct {
+		name      string
+		oid       int32
+		typmod    int32
+		precision int64
+		scale     int64
+		ok        bool
+	}{
+		{"numeric(12,4)", Numeric, 4 + (12<<16 | 4), 12, 4, true},
+		{"numeric(10,0)", Numeric, 4 + (10 << 16), 10, 0, true},
+		{"numeric(1,1)", Numeric, 4 + (1<<16 | 1), 1, 1, true},
+		{"numeric(12,-2)", Numeric, 4 + (12<<16 | (-2 & 0xffff)), 12, -2, true},
+		{"numeric(12,-84)", Numeric, 4 + (12<<16 | (-84 & 0xffff)), 12, -84, true},
+		{"numeric(1000,1000)", Numeric, 4 + (1000<<16 | 1000), 1000, 1000, true},
+		{"numeric precision without scale", Numeric, 4 + (10<<16 | 0x8000), 10, 0, false},
+		{"unconstrained numeric", Numeric, -1, 0, 0, false},
+		{"varchar", Varchar, 14, 0, 0, false},
+	}
+	for _, tc := range tests {
+		precision, scale, ok := NumericPrecisionScale(tc.oid, tc.typmod)
+		if precision != tc.precision || scale != tc.scale || ok != tc.ok {
+			t.Errorf("NumericPrecisionScale(%s) = %d, %d, %v, want %d, %d, %v",
+				tc.name, precision, scale, ok, tc.precision, tc.scale, tc.ok)
 		}
 	}
 }

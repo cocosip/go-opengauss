@@ -494,8 +494,12 @@ func rowDescriptionFrame(columns ...fakeColumn) []byte {
 		m.Int16(0) // attribute number
 		m.Int32(col.oid)
 		m.Int16(-1) // type size
-		m.Int32(-1) // type modifier
-		m.Int16(0)  // text format
+		typmod := col.typmod
+		if typmod == 0 {
+			typmod = -1
+		}
+		m.Int32(typmod) // type modifier
+		m.Int16(0)      // text format
 	}
 	return m.Finish()
 }
@@ -548,6 +552,9 @@ func (s *fakeSession) sendParameterDescription(oids ...int32) {
 type fakeColumn struct {
 	name string
 	oid  int32
+	// typmod carries a declared length or numeric precision and scale; the
+	// zero value means the server reported no modifier (-1).
+	typmod int32
 }
 
 func (s *fakeSession) sendRowDescription(columns ...fakeColumn) {

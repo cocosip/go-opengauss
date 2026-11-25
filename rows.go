@@ -12,11 +12,13 @@ import (
 	"github.com/cocosip/go-opengauss/internal/proto"
 )
 
-// column is one result column: the name database/sql exposes and the type OID
-// that selects the Go value produced for its text representation.
+// column is one result column: the name database/sql exposes, the type OID that
+// selects the Go value produced for its text representation, and the type
+// modifier that carries a declared length or numeric precision and scale.
 type column struct {
-	name string
-	oid  int32
+	name    string
+	oid     int32
+	typeMod int32
 }
 
 type rows struct {
@@ -55,6 +57,24 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 		return reflect.TypeOf("")
 	}
 	return oid.ScanType(r.columns[index].oid)
+}
+
+// ColumnTypeLength implements driver.RowsColumnTypeLength: the declared length
+// of a varchar, char, bit or varbit column, when the server reported one.
+func (r *rows) ColumnTypeLength(index int) (int64, bool) {
+	if index < 0 || index >= len(r.columns) {
+		return 0, false
+	}
+	return oid.ColumnLength(r.columns[index].oid, r.columns[index].typeMod)
+}
+
+// ColumnTypePrecisionScale implements driver.RowsColumnTypePrecisionScale for a
+// numeric column with a declared precision and scale.
+func (r *rows) ColumnTypePrecisionScale(index int) (int64, int64, bool) {
+	if index < 0 || index >= len(r.columns) {
+		return 0, 0, false
+	}
+	return oid.NumericPrecisionScale(r.columns[index].oid, r.columns[index].typeMod)
 }
 
 // finish ends the operation scope opened for this result, clearing the socket
@@ -255,7 +275,7 @@ func parseRowDescription(body []byte) ([]column, error) {
 		r.Int16() // attribute number
 		typeOID := r.Int32()
 		r.Int16() // data type size
-		r.Int32() // type modifier
+		typeMod := r.Int32()
 		format := r.Int16()
 		if r.Err != nil {
 			return nil, proto.ErrMalformedMessage
@@ -265,7 +285,7 @@ func parseRowDescription(body []byte) ([]column, error) {
 		if format != 0 {
 			return nil, fmt.Errorf("opengauss: result column %q uses binary format, which this driver does not request", name)
 		}
-		columns = append(columns, column{name: name, oid: typeOID})
+		columns = append(columns, column{name: name, oid: typeOID, typeMod: typeMod})
 	}
 	if r.Err != nil {
 		return nil, proto.ErrMalformedMessage

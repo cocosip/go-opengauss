@@ -6,6 +6,7 @@ package oid
 import (
 	"database/sql/driver"
 	"encoding/hex"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -26,12 +27,15 @@ const (
 	JSON        int32 = 114
 	Float4      int32 = 700
 	Float8      int32 = 701
+	Bpchar      int32 = 1042
 	Varchar     int32 = 1043
 	Date        int32 = 1082
 	Timestamp   int32 = 1114
 	TimestampTZ int32 = 1184
 	Interval    int32 = 1186
 	Timetz      int32 = 1266
+	Bit         int32 = 1560
+	Varbit      int32 = 1562
 	Numeric     int32 = 1700
 	UUID        int32 = 2950
 	JSONB       int32 = 3802
@@ -50,12 +54,15 @@ var typeNames = map[int32]string{
 	JSON:        "json",
 	Float4:      "float4",
 	Float8:      "float8",
+	Bpchar:      "bpchar",
 	Varchar:     "varchar",
 	Date:        "date",
 	Timestamp:   "timestamp",
 	TimestampTZ: "timestamptz",
 	Interval:    "interval",
 	Timetz:      "timetz",
+	Bit:         "bit",
+	Varbit:      "varbit",
 	Numeric:     "numeric",
 	UUID:        "uuid",
 	JSONB:       "jsonb",
@@ -83,6 +90,45 @@ func ScanType(typeOID int32) reflect.Type {
 	default:
 		return reflect.TypeOf("")
 	}
+}
+
+// ColumnLength returns the declared length of a character or bit column from
+// the type modifier in RowDescription. A character type stores VARHDRSZ plus
+// the length, while a bit type stores the bit count itself; a modifier that
+// carries no length means the column is unconstrained.
+func ColumnLength(typeOID, typeMod int32) (int64, bool) {
+	switch typeOID {
+	case Varchar, Bpchar:
+		// Postgres keeps VARHDRSZ + characters for historical reasons.
+		if typeMod > 4 {
+			return int64(typeMod - 4), true
+		}
+	case Bit, Varbit:
+		// The modifier is the bit count itself, without VARHDRSZ.
+		if typeMod > 0 {
+			return int64(typeMod), true
+		}
+	}
+	return 0, false
+}
+
+// NumericPrecisionScale decodes the type modifier of a numeric column: VARHDRSZ
+// plus (precision << 16 | scale). openGauss stores the scale as a signed 16-bit
+// field, so a negative scale (rounding before the decimal point, available in
+// A-compatibility mode) is preserved. The -32768 scale is the sentinel that
+// float_as_numeric uses for a precision without a scale, so no scale is
+// reported for it. A negative modifier means an unconstrained numeric.
+func NumericPrecisionScale(typeOID, typeMod int32) (precision, scale int64, ok bool) {
+	if typeOID != Numeric || typeMod < 4 {
+		return 0, 0, false
+	}
+	mod := uint32(typeMod - 4)
+	precision = int64((mod >> 16) & 0xffff)
+	scale = int64(int16(mod & 0xffff))
+	if scale == math.MinInt16 {
+		return precision, 0, false
+	}
+	return precision, scale, true
 }
 
 // Decode converts one text-format value. Values whose text is not in the shape

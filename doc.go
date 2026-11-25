@@ -37,8 +37,12 @@
 // the expected shape, such as infinity, a BC date or an undecodable bytea
 // escape, is also returned as text rather than guessed.
 //
-// ColumnTypes reports the database type name and the Go scan type that this
-// mapping produces for each column.
+// ColumnTypes reports the database type name, the Go scan type that this
+// mapping produces, the declared length of a varchar, char, bit or varbit
+// column, and the precision and scale of a numeric column, both taken from the
+// type modifier in the result description. A negative numeric scale, which
+// A-compatibility mode on 6.0 and later can declare, is preserved. Nullability
+// is not looked up in the catalog, so it stays unknown.
 //
 // # Multiple statements
 //
