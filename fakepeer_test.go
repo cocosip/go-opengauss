@@ -367,6 +367,12 @@ func (s *fakeSession) expectBindExecute() (statement string, args []fakeParam) {
 // completeStartup performs the normal SHA256 login and checks the password
 // proof against the published known-answer vector.
 func (s *fakeSession) completeStartup(check func(params map[string]string)) {
+	s.completeStartupEncoding("UTF8", check)
+}
+
+// completeStartupEncoding runs the SHA256 startup and reports encoding as the
+// server's client_encoding, so tests can exercise unsupported encodings.
+func (s *fakeSession) completeStartupEncoding(encoding string, check func(params map[string]string)) {
 	params := s.readStartup()
 	if check != nil {
 		check(params)
@@ -378,7 +384,7 @@ func (s *fakeSession) completeStartup(check func(params map[string]string)) {
 	}
 	s.sendAuthenticationOK()
 	s.sendParameterStatus("server_version", "7.0.0")
-	s.sendParameterStatus("client_encoding", "UTF8")
+	s.sendParameterStatus("client_encoding", encoding)
 	s.sendBackendKeyData(4242, 9001)
 	s.sendNotice("intervening notice must be consumed")
 	s.sendReady(proto.TxnIdle)

@@ -12,6 +12,7 @@ import (
 	"github.com/cocosip/go-opengauss/internal/proto"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -84,6 +85,11 @@ type conn struct {
 	backendKey  int32
 	txnStatus   byte
 	stmtCounter int
+
+	// encodingErr records a client_encoding the driver cannot decode. The
+	// connection is unusable once it is set: text would arrive in an encoding
+	// the driver treats as UTF-8.
+	encodingErr error
 
 	// An open COPY stream owns the session until CopyDone: copying records
 	// that state, copyOwner is the statement that may extend the stream,
@@ -200,8 +206,9 @@ func connectForPolicy(ctx context.Context, cfg *Config, target Target, password 
 		}
 		// A plaintext attempt may be refused by the server's host-based
 		// authentication. Retrying over TLS is only safe before a password
-		// reached the server, so an authentication failure is not retried.
-		if stageOf(plainErr) != stageStartup {
+		// reached the server, so an authentication or encoding failure is not
+		// retried.
+		if stageOf(plainErr) != stageStartup || errors.Is(plainErr, errUnsupportedClientEncoding) {
 			return nil, plainErr
 		}
 		secure, secureErr := connectOnce(ctx, cfg, target, password, true)
@@ -425,6 +432,9 @@ func (c *conn) startup(ctx context.Context) error {
 			return &stageError{stage, parseErrorResponse(body)}
 		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
+			if c.encodingErr != nil {
+				return &stageError{stageStartup, c.encodingErr}
+			}
 			if c.bad {
 				return &stageError{stageStartup, proto.ErrMalformedMessage}
 			}
@@ -434,6 +444,11 @@ func (c *conn) startup(ctx context.Context) error {
 		}
 	}
 }
+
+// errUnsupportedClientEncoding identifies a session whose client encoding the
+// driver cannot decode as UTF-8. A TLS fallback must not retry it, because the
+// password already reached the server.
+var errUnsupportedClientEncoding = errors.New("opengauss: unsupported client encoding")
 
 func (c *conn) storeParameter(body []byte) {
 	r := &proto.ReadBuf{B: body}
@@ -447,6 +462,18 @@ func (c *conn) storeParameter(body []byte) {
 		c.parameters = make(map[string]string)
 	}
 	c.parameters[name] = value
+	if strings.EqualFold(name, "client_encoding") && !supportedClientEncoding(value) {
+		c.bad = true
+		c.encodingErr = fmt.Errorf("%w: the server reports client_encoding %q, but this driver supports only UTF8 and SQL_ASCII", errUnsupportedClientEncoding, value)
+	}
+}
+
+// supportedClientEncoding reports whether text in this client encoding can be
+// passed through as Go strings. UTF8 is the encoding the driver requests;
+// SQL_ASCII stores bytes without conversion, so the driver passes them through
+// unchanged instead of interpreting them.
+func supportedClientEncoding(name string) bool {
+	return strings.EqualFold(name, "UTF8") || strings.EqualFold(name, "SQL_ASCII")
 }
 
 func (c *conn) recv() (byte, []byte, error) {
@@ -593,12 +620,22 @@ func (w *cancelWatcher) stop() {
 	<-w.exited
 }
 
+// badConnError explains why the session is unusable. An unsupported client
+// encoding is reported instead of driver.ErrBadConn so the caller learns the
+// cause, while database/sql still discards the session through ResetSession.
+func (c *conn) badConnError() error {
+	if c.encodingErr != nil {
+		return c.encodingErr
+	}
+	return driver.ErrBadConn
+}
+
 func (c *conn) beginOperation(ctx context.Context) (*cancelWatcher, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if c.bad {
-		return nil, driver.ErrBadConn
+		return nil, c.badConnError()
 	}
 	// A session in the middle of a COPY stream belongs to that stream until it
 	// finishes; any other statement would interleave with the CopyData frames.

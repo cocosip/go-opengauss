@@ -3,9 +3,11 @@ package opengauss
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -327,5 +329,57 @@ func TestLiveCopyOut(t *testing.T) {
 	}
 	if count != 3 {
 		t.Errorf("count = %d, want 3", count)
+	}
+}
+
+// TestLiveEncodings verifies the UTF-8 client contract and a non-ASCII round
+// trip against a real server, including bytea bytes that are not valid UTF-8.
+func TestLiveEncodings(t *testing.T) {
+	dsn := os.Getenv("OPENGAUSS_DSN")
+	if dsn == "" {
+		t.Skip("set OPENGAUSS_DSN to run against a live openGauss server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	defer func() { _ = db.Close() }()
+
+	var encoding string
+	if err := db.QueryRowContext(ctx, "SHOW client_encoding").Scan(&encoding); err != nil {
+		t.Fatalf("SHOW client_encoding: %v", err)
+	}
+	if !strings.EqualFold(encoding, "UTF8") {
+		t.Fatalf("client_encoding = %q, want UTF8", encoding)
+	}
+
+	const text = "héllo — 世界 🚀"
+	var gotText string
+	if err := db.QueryRowContext(ctx, "SELECT $1::text", text).Scan(&gotText); err != nil {
+		t.Fatalf("non-ASCII round trip: %v", err)
+	}
+	if gotText != text {
+		t.Errorf("text = %q, want %q", gotText, text)
+	}
+
+	raw := []byte{0xff, 0x00, 0x80}
+	var gotRaw []byte
+	if err := db.QueryRowContext(ctx, "SELECT $1::bytea", `\x`+hex.EncodeToString(raw)).Scan(&gotRaw); err != nil {
+		t.Fatalf("bytea round trip: %v", err)
+	}
+	if !reflect.DeepEqual(gotRaw, raw) {
+		t.Errorf("bytea = %x, want %x", gotRaw, raw)
+	}
+
+	var gotNull any = "sentinel"
+	if err := db.QueryRowContext(ctx, "SELECT NULL::text").Scan(&gotNull); err != nil {
+		t.Fatalf("NULL round trip: %v", err)
+	}
+	if gotNull != nil {
+		t.Errorf("NULL = %v, want nil", gotNull)
 	}
 }

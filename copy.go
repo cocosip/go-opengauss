@@ -323,7 +323,7 @@ func (s *copyStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (d
 		return nil, errors.New("opengauss: statement is already closed")
 	}
 	if s.conn.bad {
-		return nil, driver.ErrBadConn
+		return nil, s.conn.badConnError()
 	}
 	if s.finished {
 		return nil, errors.New("opengauss: the COPY ... FROM STDIN stream is already finished")
@@ -411,7 +411,13 @@ func (c *conn) beginCopyIn(ctx context.Context, owner *copyStmt) error {
 				return c.wrapIOError(ctx, "copy", drainErr)
 			}
 			return serverErr
-		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
+		case proto.MsgParameterStatus:
+			c.storeParameter(body)
+			if c.encodingErr != nil {
+				c.endOperation(watcher)
+				return c.encodingErr
+			}
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse:
 			// Asynchronous messages are not part of the COPY exchange.
 		default:
 			c.bad = true
@@ -549,10 +555,15 @@ func (c *conn) finishCopyIn() (string, error) {
 			if serverErr != nil {
 				return "", serverErr
 			}
+			if c.encodingErr != nil {
+				return "", c.encodingErr
+			}
 			return tag, nil
 		case proto.MsgErrorResponse:
 			serverErr = parseErrorResponse(body)
-		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus,
+		case proto.MsgParameterStatus:
+			c.storeParameter(body)
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse,
 			proto.MsgEmptyQueryResponse, proto.MsgRowDescription, proto.MsgDataRow, proto.MsgNoData,
 			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgParameterDescription, proto.MsgCloseComplete:
 			// Asynchronous messages and the payload of a trailing statement are

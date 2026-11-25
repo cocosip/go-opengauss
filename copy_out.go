@@ -127,7 +127,20 @@ func (r *copyOutRows) Next(dest []driver.Value) error {
 				return drainErr
 			}
 			return serverErr
-		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
+		case proto.MsgParameterStatus:
+			r.conn.storeParameter(body)
+			if r.conn.encodingErr != nil {
+				// The remaining copy data would be decoded with the wrong
+				// encoding, so the stream is abandoned before it is returned.
+				r.done = true
+				r.pending = nil
+				if stopErr := r.abort(); stopErr != nil {
+					r.conn.bad = true
+					return errors.Join(r.conn.encodingErr, stopErr)
+				}
+				return r.conn.encodingErr
+			}
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse:
 			// Asynchronous messages carry no copy data.
 		default:
 			r.conn.bad = true
@@ -334,7 +347,13 @@ func (c *conn) queryCopyOut(ctx context.Context, statement string) (driver.Rows,
 				return nil, c.wrapIOError(ctx, "copy out", drainErr)
 			}
 			return nil, serverErr
-		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
+		case proto.MsgParameterStatus:
+			c.storeParameter(body)
+			if c.encodingErr != nil {
+				c.endOperation(watcher)
+				return nil, c.encodingErr
+			}
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse:
 			// Asynchronous messages are not part of the COPY exchange.
 		default:
 			c.bad = true

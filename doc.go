@@ -15,13 +15,18 @@
 //
 // # Values
 //
-// Parameters and results use the server's text representation. A parameter is
-// converted to text as follows: string and []byte pass through unchanged, int64
-// and float64 use their decimal form, bool becomes 1 or 0, time.Time uses an
-// ISO timestamp with its zone offset, and nil is SQL NULL. A []byte parameter
-// therefore carries text, not a binary value: send a bytea column as []byte
-// holding "\x" followed by hex digits, or as a string in the legacy escape
-// form.
+// Parameters and results use the server's text representation. The driver
+// requests client_encoding=UTF8, so the server transcodes text to UTF-8; a
+// session that reports any other client encoding than UTF8 or SQL_ASCII is
+// rejected at startup, and a runtime change marks the session unusable. A
+// session that never reports client_encoding is treated as UTF8. SQL_ASCII
+// sessions pass bytes through unchanged, so their text may not be valid UTF-8.
+// A parameter is converted to text as follows: string and []byte pass through
+// unchanged, int64 and float64 use their decimal form, bool becomes 1 or 0,
+// time.Time uses an ISO timestamp with its zone offset, and nil is SQL NULL. A
+// []byte parameter therefore carries text, not a binary value: send a bytea
+// column as []byte holding "\x" followed by hex digits, or as a string in the
+// legacy escape form.
 //
 // Results are decoded by the type OID reported for each column: bool becomes
 // bool, int2/int4/int8/oid become int64, float4/float8 become float64 (NaN and

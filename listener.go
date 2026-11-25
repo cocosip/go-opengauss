@@ -445,7 +445,9 @@ func (l *Listener) loop(current *conn) {
 				l.handleNotice(parseErrorResponse(msg.body))
 			case proto.MsgParameterStatus:
 				current.storeParameter(msg.body)
-				if current.bad {
+				if current.encodingErr != nil {
+					disconnect(current.encodingErr)
+				} else if current.bad {
 					disconnect(proto.ErrMalformedMessage)
 				}
 			case proto.MsgCommandComplete, proto.MsgEmptyQueryResponse:

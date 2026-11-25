@@ -38,7 +38,7 @@ func (c *conn) PrepareContext(ctx context.Context, statement string) (driver.Stm
 	// guarantees for a statement prepared from a *sql.Tx.
 	if kind == copyIn {
 		if c.bad {
-			return nil, driver.ErrBadConn
+			return nil, c.badConnError()
 		}
 		if c.txnStatus != proto.TxnInTransaction {
 			return nil, errors.New("opengauss: COPY ... FROM STDIN must run inside a transaction: use CopyIn(tx, ...)")
@@ -117,7 +117,12 @@ func (c *conn) readPrepareResult() (int, error) {
 				return 0, err
 			}
 			return 0, serverErr
-		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
+		case proto.MsgParameterStatus:
+			c.storeParameter(body)
+			if c.encodingErr != nil {
+				return 0, c.encodingErr
+			}
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse:
 			// Asynchronous messages.
 		default:
 			c.bad = true
@@ -186,7 +191,7 @@ func (s *stmt) frames(args []driver.NamedValue) ([][]byte, error) {
 		return nil, errors.New("opengauss: statement is already closed")
 	}
 	if s.conn.bad {
-		return nil, driver.ErrBadConn
+		return nil, s.conn.badConnError()
 	}
 	if len(args) != s.paramCount {
 		return nil, fmt.Errorf("opengauss: statement expects %d parameters, got %d", s.paramCount, len(args))
@@ -212,7 +217,12 @@ func (c *conn) readCloseResult() error {
 				return err
 			}
 			return serverErr
-		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
+		case proto.MsgParameterStatus:
+			c.storeParameter(body)
+			if c.encodingErr != nil {
+				return c.encodingErr
+			}
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse:
 			// Asynchronous messages.
 		default:
 			c.bad = true

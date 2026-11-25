@@ -74,8 +74,11 @@ func (r *rows) Close() error {
 			r.conn.bad = true
 			return cause
 		}
+		return err
 	}
-	return err
+	// A client encoding the driver cannot decode may have arrived while the
+	// unread rows were discarded; the session is already marked unusable.
+	return r.conn.encodingErr
 }
 
 func (r *rows) Next(dest []driver.Value) error {
@@ -122,7 +125,15 @@ func (r *rows) Next(dest []driver.Value) error {
 				return drainErr
 			}
 			return serverErr
-		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
+		case proto.MsgParameterStatus:
+			r.conn.storeParameter(body)
+			if r.conn.encodingErr != nil {
+				r.conn.bad = true
+				r.done = true
+				r.finish()
+				return r.conn.encodingErr
+			}
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse:
 			// Asynchronous messages carry no column data.
 		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
 			r.conn.bad = true

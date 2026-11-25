@@ -25,7 +25,7 @@ func (c *conn) Begin() (driver.Tx, error) {
 // mode. openGauss has no READ WRITE suffix; the default is read-write.
 func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if c.bad {
-		return nil, driver.ErrBadConn
+		return nil, c.badConnError()
 	}
 	if c.txnStatus != proto.TxnIdle {
 		c.bad = true
@@ -84,7 +84,7 @@ func (t *tx) Commit() error {
 	}
 	t.closed = true
 	if t.conn.bad {
-		return driver.ErrBadConn
+		return t.conn.badConnError()
 	}
 	tag, err := t.conn.simpleExec(context.Background(), "COMMIT")
 	if err != nil {
@@ -114,7 +114,7 @@ func (t *tx) Rollback() error {
 	}
 	t.closed = true
 	if t.conn.bad {
-		return driver.ErrBadConn
+		return t.conn.badConnError()
 	}
 	if t.conn.txnStatus == proto.TxnIdle {
 		// A previous statement already ended the transaction.

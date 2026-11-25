@@ -288,7 +288,12 @@ func (c *conn) readExecResult() (string, error) {
 				return "", err
 			}
 			return "", serverErr
-		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
+		case proto.MsgParameterStatus:
+			c.storeParameter(body)
+			if c.encodingErr != nil {
+				return "", c.encodingErr
+			}
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse:
 			// Asynchronous messages are not part of the command result.
 		case proto.MsgRowDescription, proto.MsgDataRow, proto.MsgEmptyQueryResponse, proto.MsgNoData,
 			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgParameterDescription, proto.MsgCloseComplete:
@@ -321,6 +326,9 @@ func (c *conn) readQueryRows() (*rows, error) {
 			if err := c.drainUntilReady(); err != nil {
 				return nil, err
 			}
+			if c.encodingErr != nil {
+				return nil, c.encodingErr
+			}
 			return &rows{conn: c, done: true}, nil
 		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
@@ -331,7 +339,12 @@ func (c *conn) readQueryRows() (*rows, error) {
 				return nil, err
 			}
 			return nil, serverErr
-		case proto.MsgEmptyQueryResponse, proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus,
+		case proto.MsgParameterStatus:
+			c.storeParameter(body)
+			if c.encodingErr != nil {
+				return nil, c.encodingErr
+			}
+		case proto.MsgEmptyQueryResponse, proto.MsgNoticeResponse, proto.MsgNotificationResponse,
 			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgNoData, proto.MsgParameterDescription, proto.MsgCloseComplete:
 			// Empty query and extended-protocol acknowledgements carry no rows.
 		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
@@ -357,7 +370,9 @@ func (c *conn) drainUntilReady() error {
 		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
 			return nil
-		case proto.MsgErrorResponse, proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus,
+		case proto.MsgParameterStatus:
+			c.storeParameter(body)
+		case proto.MsgErrorResponse, proto.MsgNoticeResponse, proto.MsgNotificationResponse,
 			proto.MsgCommandComplete, proto.MsgDataRow, proto.MsgRowDescription, proto.MsgEmptyQueryResponse,
 			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgNoData, proto.MsgParameterDescription, proto.MsgCloseComplete,
 			proto.MsgCopyData, proto.MsgCopyDone:
