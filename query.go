@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"github.com/cocosip/go-opengauss/internal/proto"
 	"math"
 	"strconv"
 	"strings"
@@ -93,9 +94,9 @@ func (c *conn) simpleExec(ctx context.Context, statement string) (string, error)
 	if err := validateQuery(statement); err != nil {
 		return "", err
 	}
-	query := newMessageWriter(msgQuery)
-	query.string(statement)
-	return c.execFrames(ctx, "exec", [][]byte{query.finish()})
+	query := proto.NewMessageWriter(proto.MsgQuery)
+	query.String(statement)
+	return c.execFrames(ctx, "exec", [][]byte{query.Finish()})
 }
 
 // Ping verifies that the session is usable. The empty statement returns
@@ -114,7 +115,7 @@ func (c *conn) ResetSession(context.Context) error {
 	if c.bad {
 		return driver.ErrBadConn
 	}
-	if c.txnStatus != txnIdle {
+	if c.txnStatus != proto.TxnIdle {
 		c.bad = true
 		return driver.ErrBadConn
 	}
@@ -127,7 +128,7 @@ func (c *conn) Close() error {
 		return nil
 	}
 	if !c.bad {
-		_ = c.sendFrames(newMessageWriter(msgTerminate).finish())
+		_ = c.sendFrames(proto.NewMessageWriter(proto.MsgTerminate).Finish())
 	}
 	err := c.netConn.Close()
 	c.netConn = nil
@@ -144,21 +145,21 @@ func validateQuery(statement string) error {
 // queryFrames builds the frontend messages for one statement.
 func queryFrames(statement string, args []driver.NamedValue) ([][]byte, error) {
 	if len(args) == 0 {
-		query := newMessageWriter(msgQuery)
-		query.string(statement)
-		return [][]byte{query.finish()}, nil
+		query := proto.NewMessageWriter(proto.MsgQuery)
+		query.String(statement)
+		return [][]byte{query.Finish()}, nil
 	}
 
-	parse := newMessageWriter(msgParse)
-	parse.string("") // unnamed statement
-	parse.string(statement)
-	parse.int16(0) // let the server infer parameter types
+	parse := proto.NewMessageWriter(proto.MsgParse)
+	parse.String("") // unnamed statement
+	parse.String(statement)
+	parse.Int16(0) // let the server infer parameter types
 
 	bindExecute, err := bindExecuteFrames("", args)
 	if err != nil {
 		return nil, err
 	}
-	return append([][]byte{parse.finish()}, bindExecute...), nil
+	return append([][]byte{parse.Finish()}, bindExecute...), nil
 }
 
 // bindExecuteFrames builds Bind, Describe(portal), Execute and Sync.
@@ -168,19 +169,19 @@ func bindExecuteFrames(statement string, args []driver.NamedValue) ([][]byte, er
 		return nil, err
 	}
 
-	describe := newMessageWriter(msgDescribe)
-	describe.byte('P')
-	describe.string("") // unnamed portal
+	describe := proto.NewMessageWriter(proto.MsgDescribe)
+	describe.Byte('P')
+	describe.String("") // unnamed portal
 
-	execute := newMessageWriter(msgExecute)
-	execute.string("")
-	execute.int32(0) // no row limit
+	execute := proto.NewMessageWriter(proto.MsgExecute)
+	execute.String("")
+	execute.Int32(0) // no row limit
 
 	return [][]byte{
 		bind,
-		describe.finish(),
-		execute.finish(),
-		newMessageWriter(msgSync).finish(),
+		describe.Finish(),
+		execute.Finish(),
+		proto.NewMessageWriter(proto.MsgSync).Finish(),
 	}, nil
 }
 
@@ -191,14 +192,14 @@ func bindFrame(statement string, args []driver.NamedValue) ([]byte, error) {
 	if len(args) > math.MaxInt16 {
 		return nil, fmt.Errorf("opengauss: too many parameters: %d", len(args))
 	}
-	bind := newMessageWriter(msgBind)
-	bind.string("") // unnamed portal
-	bind.string(statement)
-	bind.int16(0) // all parameters use text format
-	bind.int16(int16(len(args)))
+	bind := proto.NewMessageWriter(proto.MsgBind)
+	bind.String("") // unnamed portal
+	bind.String(statement)
+	bind.Int16(0) // all parameters use text format
+	bind.Int16(int16(len(args)))
 	for _, arg := range args {
 		if arg.Value == nil {
-			bind.int32(-1)
+			bind.Int32(-1)
 			continue
 		}
 		data, err := encodeTextValue(arg.Value)
@@ -208,11 +209,11 @@ func bindFrame(statement string, args []driver.NamedValue) ([]byte, error) {
 		if len(data) > math.MaxInt32 {
 			return nil, fmt.Errorf("opengauss: parameter %d is too large: %d bytes", arg.Ordinal, len(data))
 		}
-		bind.int32(int32(len(data)))
-		bind.bytes(data)
+		bind.Int32(int32(len(data)))
+		bind.Bytes(data)
 	}
-	bind.int16(0) // all results use text format
-	return bind.finish(), nil
+	bind.Int16(0) // all results use text format
+	return bind.Finish(), nil
 }
 
 func encodeTextValue(value driver.Value) ([]byte, error) {
@@ -245,23 +246,23 @@ func (c *conn) readExecResult() (string, error) {
 			return "", err
 		}
 		switch typ {
-		case msgCommandComplete:
+		case proto.MsgCommandComplete:
 			tag = commandTag(body)
-		case msgReadyForQuery:
+		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
 			return tag, nil
-		case msgErrorResponse:
+		case proto.MsgErrorResponse:
 			serverErr := parseErrorResponse(body)
 			if err := c.drainUntilReady(); err != nil {
 				return "", err
 			}
 			return "", serverErr
-		case msgNoticeResponse, msgNotificationResponse, msgParameterStatus:
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
 			// Asynchronous messages are not part of the command result.
-		case msgRowDescription, msgDataRow, msgEmptyQueryResponse, msgNoData,
-			msgParseComplete, msgBindComplete, msgParameterDescription, msgCloseComplete:
+		case proto.MsgRowDescription, proto.MsgDataRow, proto.MsgEmptyQueryResponse, proto.MsgNoData,
+			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgParameterDescription, proto.MsgCloseComplete:
 			// Exec discards any result payload.
-		case msgCopyInResponse, msgCopyOutResponse, msgCopyBothResponse:
+		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
 			c.bad = true
 			return "", fmt.Errorf("opengauss: COPY is not implemented yet (message %q)", typ)
 		default:
@@ -278,31 +279,31 @@ func (c *conn) readQueryRows() (*rows, error) {
 			return nil, err
 		}
 		switch typ {
-		case msgRowDescription:
+		case proto.MsgRowDescription:
 			columns, err := parseRowDescription(body)
 			if err != nil {
 				c.bad = true
 				return nil, err
 			}
 			return &rows{conn: c, columns: columns}, nil
-		case msgCommandComplete:
+		case proto.MsgCommandComplete:
 			if err := c.drainUntilReady(); err != nil {
 				return nil, err
 			}
 			return &rows{conn: c, done: true}, nil
-		case msgReadyForQuery:
+		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
 			return &rows{conn: c, done: true}, nil
-		case msgErrorResponse:
+		case proto.MsgErrorResponse:
 			serverErr := parseErrorResponse(body)
 			if err := c.drainUntilReady(); err != nil {
 				return nil, err
 			}
 			return nil, serverErr
-		case msgEmptyQueryResponse, msgNoticeResponse, msgNotificationResponse, msgParameterStatus,
-			msgParseComplete, msgBindComplete, msgNoData, msgParameterDescription, msgCloseComplete:
+		case proto.MsgEmptyQueryResponse, proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus,
+			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgNoData, proto.MsgParameterDescription, proto.MsgCloseComplete:
 			// Empty query and extended-protocol acknowledgements carry no rows.
-		case msgCopyInResponse, msgCopyOutResponse, msgCopyBothResponse:
+		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
 			c.bad = true
 			return nil, fmt.Errorf("opengauss: COPY is not implemented yet (message %q)", typ)
 		default:
@@ -322,14 +323,14 @@ func (c *conn) drainUntilReady() error {
 			return err
 		}
 		switch typ {
-		case msgReadyForQuery:
+		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
 			return nil
-		case msgErrorResponse, msgNoticeResponse, msgNotificationResponse, msgParameterStatus,
-			msgCommandComplete, msgDataRow, msgRowDescription, msgEmptyQueryResponse,
-			msgParseComplete, msgBindComplete, msgNoData, msgParameterDescription, msgCloseComplete:
+		case proto.MsgErrorResponse, proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus,
+			proto.MsgCommandComplete, proto.MsgDataRow, proto.MsgRowDescription, proto.MsgEmptyQueryResponse,
+			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgNoData, proto.MsgParameterDescription, proto.MsgCloseComplete:
 			// Discarded while resynchronizing.
-		case msgCopyInResponse, msgCopyOutResponse, msgCopyBothResponse:
+		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
 			c.bad = true
 			return fmt.Errorf("opengauss: COPY is not implemented yet (message %q)", typ)
 		default:
@@ -340,6 +341,6 @@ func (c *conn) drainUntilReady() error {
 }
 
 func commandTag(body []byte) string {
-	r := &readBuf{b: body}
-	return r.string()
+	r := &proto.ReadBuf{B: body}
+	return r.String()
 }

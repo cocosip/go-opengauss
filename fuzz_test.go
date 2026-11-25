@@ -3,6 +3,7 @@ package opengauss
 import (
 	"bufio"
 	"bytes"
+	"github.com/cocosip/go-opengauss/internal/proto"
 	"testing"
 )
 
@@ -10,11 +11,11 @@ import (
 // driver. `go test` runs the seed corpus; `go test -fuzz=Fuzz...` explores.
 
 func FuzzReadMessage(f *testing.F) {
-	f.Add([]byte{'Z', 0, 0, 0, 5, txnIdle})
+	f.Add([]byte{'Z', 0, 0, 0, 5, proto.TxnIdle})
 	f.Add([]byte{'T', 0, 0, 0, 6, 0, 1})
 	f.Add([]byte{'E', 0xff, 0xff, 0xff, 0xff})
 	f.Fuzz(func(t *testing.T, data []byte) {
-		_, _, _ = readMessage(bufio.NewReader(bytes.NewReader(data)))
+		_, _, _ = proto.ReadMessage(bufio.NewReader(bytes.NewReader(data)))
 	})
 }
 

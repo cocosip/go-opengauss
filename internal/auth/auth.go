@@ -1,4 +1,7 @@
-package opengauss
+// Package auth implements the password exchanges of the openGauss protocol.
+// It parses AuthenticationRequest bodies and produces the PasswordMessage
+// payloads; it does no I/O.
+package auth
 
 import (
 	"crypto/hmac"
@@ -9,129 +12,132 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+
+	"github.com/cocosip/go-opengauss/internal/proto"
 )
 
 // Authentication request codes from src/include/libpq/pqcomm.h.
 const (
-	authOK                int32 = 0
-	authCleartextPassword int32 = 3
-	authMD5Password       int32 = 5
-	authGSS               int32 = 7
-	authGSSContinue       int32 = 8
-	authSSPI              int32 = 9
-	authSHA256            int32 = 10
-	authMD5SHA256         int32 = 11
-	authLiteSHA256        int32 = 12
-	authSM3               int32 = 13
+	OK                 int32 = 0
+	RequestCleartext   int32 = 3
+	RequestMD5         int32 = 5
+	RequestGSS         int32 = 7
+	RequestGSSContinue int32 = 8
+	RequestSSPI        int32 = 9
+	RequestSHA256      int32 = 10
+	RequestMD5SHA256   int32 = 11
+	RequestLiteSHA256  int32 = 12
+	RequestSM3         int32 = 13
 )
 
 // Password storage methods reported inside an AuthenticationSHA256Request.
 const (
-	passwordStoredPlain  int32 = 0
-	passwordStoredMD5    int32 = 1
-	passwordStoredSHA256 int32 = 2
+	StoredPlain  int32 = 0
+	StoredMD5    int32 = 1
+	StoredSHA256 int32 = 2
 )
 
 // maxSHA256Iterations caps the PBKDF2 work a server may demand. Real servers
 // use 2048 or 10000 iterations; a hostile peer must not pin a CPU core.
 const maxSHA256Iterations = 1_000_000
 
-// authMethodName describes an authentication request for errors and logs.
-func authMethodName(code int32) string {
+// methodName describes an authentication request for errors and logs.
+func methodName(code int32) string {
 	switch code {
-	case authOK:
+	case OK:
 		return "AuthenticationOk"
-	case authCleartextPassword:
+	case RequestCleartext:
 		return "cleartext password"
-	case authMD5Password:
+	case RequestMD5:
 		return "MD5"
-	case authGSS:
+	case RequestGSS:
 		return "GSSAPI"
-	case authGSSContinue:
+	case RequestGSSContinue:
 		return "GSSAPI continue"
-	case authSSPI:
+	case RequestSSPI:
 		return "SSPI"
-	case authSHA256:
+	case RequestSHA256:
 		return "SHA256"
-	case authMD5SHA256:
+	case RequestMD5SHA256:
 		return "MD5-SHA256"
-	case authLiteSHA256:
+	case RequestLiteSHA256:
 		return "Lite SHA256_RFC"
-	case authSM3:
+	case RequestSM3:
 		return "SM3"
 	default:
 		return fmt.Sprintf("unknown (request %d)", code)
 	}
 }
 
-// authResponse produces the PasswordMessage body for one AuthenticationRequest
-// body. It returns a nil payload when the request needs no response.
+// Response produces the PasswordMessage body for one AuthenticationRequest.
+// The cursor must be positioned after the request code. It returns a nil
+// payload when the request needs no response.
 //
 // The openGauss-specific exchanges that are not implemented yet are rejected
 // with the method name instead of being silently skipped.
-func authResponse(code int32, r *readBuf, cfg *Config) ([]byte, error) {
+func Response(code int32, r *proto.ReadBuf, user, password string) ([]byte, error) {
 	switch code {
-	case authOK:
+	case OK:
 		return nil, nil
-	case authCleartextPassword:
-		if cfg.Password == "" {
+	case RequestCleartext:
+		if password == "" {
 			return nil, errors.New("server requested a password but the DSN supplied none")
 		}
-		return append([]byte(cfg.Password), 0), nil
-	case authMD5Password:
-		salt := r.bytes(4)
-		if r.err != nil {
-			return nil, r.err
+		return append([]byte(password), 0), nil
+	case RequestMD5:
+		salt := r.Bytes(4)
+		if r.Err != nil {
+			return nil, r.Err
 		}
-		return append([]byte(md5Password(cfg.Password, cfg.User, salt)), 0), nil
-	case authSHA256:
-		return authSHA256Response(r, cfg)
-	case authMD5SHA256:
-		return nil, unsupportedAuth(code, "use a server that requests SHA256, MD5 or cleartext password authentication")
-	case authLiteSHA256:
-		return nil, unsupportedAuth(code, "request 12 needs a matching Lite build and is not implemented yet")
-	case authSM3:
-		return nil, unsupportedAuth(code, "SM3 authentication is not implemented yet")
-	case authGSS, authGSSContinue:
-		return nil, unsupportedAuth(code, "Kerberos/SPNEGO authentication is not implemented yet")
-	case authSSPI:
-		return nil, unsupportedAuth(code, "Windows integrated logon is not implemented yet")
+		return append([]byte(md5Password(password, user, salt)), 0), nil
+	case RequestSHA256:
+		return sha256Response(r, user, password)
+	case RequestMD5SHA256:
+		return nil, unsupported(code, "use a server that requests SHA256, MD5 or cleartext password authentication")
+	case RequestLiteSHA256:
+		return nil, unsupported(code, "request 12 needs a matching Lite build and is not implemented yet")
+	case RequestSM3:
+		return nil, unsupported(code, "SM3 authentication is not implemented yet")
+	case RequestGSS, RequestGSSContinue:
+		return nil, unsupported(code, "Kerberos/SPNEGO authentication is not implemented yet")
+	case RequestSSPI:
+		return nil, unsupported(code, "Windows integrated logon is not implemented yet")
 	default:
-		return nil, unsupportedAuth(code, "the driver does not know this exchange")
+		return nil, unsupported(code, "the driver does not know this exchange")
 	}
 }
 
-func unsupportedAuth(code int32, hint string) error {
-	return fmt.Errorf("unsupported authentication method %s: %s", authMethodName(code), hint)
+func unsupported(code int32, hint string) error {
+	return fmt.Errorf("unsupported authentication method %s: %s", methodName(code), hint)
 }
 
-func authSHA256Response(r *readBuf, cfg *Config) ([]byte, error) {
-	storedMethod := r.int32()
-	if r.err != nil {
-		return nil, r.err
+func sha256Response(r *proto.ReadBuf, user, password string) ([]byte, error) {
+	storedMethod := r.Int32()
+	if r.Err != nil {
+		return nil, r.Err
 	}
 	switch storedMethod {
-	case passwordStoredPlain, passwordStoredSHA256:
-		if cfg.Password == "" {
+	case StoredPlain, StoredSHA256:
+		if password == "" {
 			return nil, errors.New("server requested password authentication but the DSN supplied no password")
 		}
-		random64code := string(r.bytes(64))
-		token := string(r.bytes(8))
-		iteration := int(r.int32())
-		if r.err != nil {
-			return nil, r.err
+		random64code := string(r.Bytes(64))
+		token := string(r.Bytes(8))
+		iteration := int(r.Int32())
+		if r.Err != nil {
+			return nil, r.Err
 		}
-		proof, err := sha256Proof(cfg.Password, random64code, token, iteration)
+		proof, err := sha256Proof(password, random64code, token, iteration)
 		if err != nil {
 			return nil, err
 		}
 		return append([]byte(proof), 0), nil
-	case passwordStoredMD5:
-		salt := r.bytes(4)
-		if r.err != nil {
-			return nil, r.err
+	case StoredMD5:
+		salt := r.Bytes(4)
+		if r.Err != nil {
+			return nil, r.Err
 		}
-		return append([]byte(md5Password(cfg.Password, cfg.User, salt)), 0), nil
+		return append([]byte(md5Password(password, user, salt)), 0), nil
 	default:
 		return nil, fmt.Errorf("unsupported stored password method %d: the server must store the password as plain, md5 or sha256", storedMethod)
 	}

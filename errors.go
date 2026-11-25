@@ -2,6 +2,7 @@ package opengauss
 
 import (
 	"fmt"
+	"github.com/cocosip/go-opengauss/internal/proto"
 	"strconv"
 )
 
@@ -52,14 +53,14 @@ func (e *Error) Error() string {
 // skipped so a newer server does not break the driver.
 func parseErrorResponse(body []byte) *Error {
 	e := &Error{}
-	r := &readBuf{b: body}
-	for r.remaining() > 0 {
-		field := r.byte()
-		if r.err != nil || field == 0 {
+	r := &proto.ReadBuf{B: body}
+	for r.Remaining() > 0 {
+		field := r.Byte()
+		if r.Err != nil || field == 0 {
 			break
 		}
-		value := r.string()
-		if r.err != nil {
+		value := r.String()
+		if r.Err != nil {
 			break
 		}
 		switch field {

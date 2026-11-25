@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"github.com/cocosip/go-opengauss/internal/proto"
 )
 
 // stmt is a prepared statement bound to one physical connection. It uses the
@@ -37,16 +38,16 @@ func (c *conn) PrepareContext(ctx context.Context, statement string) (driver.Stm
 	c.stmtCounter++
 	name := fmt.Sprintf("opengauss_stmt_%d", c.stmtCounter)
 
-	parse := newMessageWriter(msgParse)
-	parse.string(name)
-	parse.string(statement)
-	parse.int16(0) // let the server infer parameter types
+	parse := proto.NewMessageWriter(proto.MsgParse)
+	parse.String(name)
+	parse.String(statement)
+	parse.Int16(0) // let the server infer parameter types
 
-	describe := newMessageWriter(msgDescribe)
-	describe.byte('S')
-	describe.string(name)
+	describe := proto.NewMessageWriter(proto.MsgDescribe)
+	describe.Byte('S')
+	describe.String(name)
 
-	if err := c.sendFrames(parse.finish(), describe.finish(), newMessageWriter(msgSync).finish()); err != nil {
+	if err := c.sendFrames(parse.Finish(), describe.Finish(), proto.NewMessageWriter(proto.MsgSync).Finish()); err != nil {
 		return nil, c.wrapIOError(ctx, "prepare", err)
 	}
 
@@ -65,35 +66,35 @@ func (c *conn) readPrepareResult() (int, error) {
 			return 0, err
 		}
 		switch typ {
-		case msgParseComplete:
+		case proto.MsgParseComplete:
 			// Parse accepted.
-		case msgParameterDescription:
-			r := &readBuf{b: body}
-			paramCount = int(r.int16())
+		case proto.MsgParameterDescription:
+			r := &proto.ReadBuf{B: body}
+			paramCount = int(r.Int16())
 			for i := 0; i < paramCount; i++ {
-				r.int32()
+				r.Int32()
 			}
-			if r.err != nil {
+			if r.Err != nil {
 				c.bad = true
-				return 0, r.err
+				return 0, r.Err
 			}
-		case msgRowDescription:
+		case proto.MsgRowDescription:
 			if _, err := parseRowDescription(body); err != nil {
 				c.bad = true
 				return 0, err
 			}
-		case msgNoData:
+		case proto.MsgNoData:
 			// The statement returns no rows.
-		case msgReadyForQuery:
+		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
 			return paramCount, nil
-		case msgErrorResponse:
+		case proto.MsgErrorResponse:
 			serverErr := parseErrorResponse(body)
 			if err := c.drainUntilReady(); err != nil {
 				return 0, err
 			}
 			return 0, serverErr
-		case msgNoticeResponse, msgNotificationResponse, msgParameterStatus:
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
 			// Asynchronous messages.
 		default:
 			c.bad = true
@@ -147,11 +148,11 @@ func (s *stmt) Close() error {
 		return nil
 	}
 
-	closeStatement := newMessageWriter(msgClose)
-	closeStatement.byte('S')
-	closeStatement.string(s.name)
+	closeStatement := proto.NewMessageWriter(proto.MsgClose)
+	closeStatement.Byte('S')
+	closeStatement.String(s.name)
 
-	if err := s.conn.sendFrames(closeStatement.finish(), newMessageWriter(msgSync).finish()); err != nil {
+	if err := s.conn.sendFrames(closeStatement.Finish(), proto.NewMessageWriter(proto.MsgSync).Finish()); err != nil {
 		return err
 	}
 	return s.conn.readCloseResult()
@@ -177,18 +178,18 @@ func (c *conn) readCloseResult() error {
 			return err
 		}
 		switch typ {
-		case msgCloseComplete:
+		case proto.MsgCloseComplete:
 			// Statement deallocated.
-		case msgReadyForQuery:
+		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
 			return nil
-		case msgErrorResponse:
+		case proto.MsgErrorResponse:
 			serverErr := parseErrorResponse(body)
 			if err := c.drainUntilReady(); err != nil {
 				return err
 			}
 			return serverErr
-		case msgNoticeResponse, msgNotificationResponse, msgParameterStatus:
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
 			// Asynchronous messages.
 		default:
 			c.bad = true

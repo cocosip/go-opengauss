@@ -28,6 +28,20 @@ defer db.Close()
 return db.PingContext(ctx)
 ```
 
+## Package layout
+
+The public import path stays a single package, `opengauss`. Supporting code is layered below it:
+
+| Package | Responsibility |
+| --- | --- |
+| `opengauss` (root) | `database/sql` integration, connection state machine, queries, transactions, TLS policy, public `Config` and `*Error`, DSN/environment/service/passfile resolution |
+| `internal/proto` | wire framing, message types and the message reader/writer |
+| `internal/auth` | password exchanges (cleartext, MD5, SHA256 proof) |
+| `internal/pgpassfile` | libpq passfile parsing |
+| `internal/pgservicefile` | libpq service-file parsing |
+
+Dependencies point inward only: the root imports the internal packages, `internal/auth` may use `internal/proto`, and the parsers use only the standard library. Keeping the helpers internal keeps the public surface stable while the driver grows into the remaining feature-matrix rows.
+
 ## First public API
 
 The proposed initial surface is `sql.Open("opengauss", dsn)` and `opengauss.NewConnector(dsn string) (*Connector, error)` followed by `sql.OpenDB(connector)`. Both entry points use the same parser and connection state machine. Connector creation may resolve local configuration files but must not contact the database. Syntax and local configuration errors can surface at construction. Dial, TLS, authentication and session errors surface at the first operation requiring a connection, including PingContext. A connector can open multiple physical connections concurrently. Only immutable settings are shared.

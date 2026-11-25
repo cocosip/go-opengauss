@@ -296,16 +296,6 @@ func TestPassfilePasswordStopsAtUnescapedColon(t *testing.T) {
 	}
 }
 
-func TestSplitPassfileLineKeepsEscapedStarLiteral(t *testing.T) {
-	fields, ok := splitPassfileLine(`\*:5432:app:alice:\*`)
-	if !ok {
-		t.Fatal("splitPassfileLine reported a malformed line")
-	}
-	if fields[0] != `\*` {
-		t.Errorf("host field = %q, want a literal backslash-star", fields[0])
-	}
-}
-
 func TestDefaultServiceFileOnWindows(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows-specific path")

@@ -8,6 +8,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/cocosip/go-opengauss/internal/auth"
+	"github.com/cocosip/go-opengauss/internal/proto"
 	"io"
 	"net"
 	"strconv"
@@ -196,7 +198,7 @@ func (c *conn) setStartupDeadline(ctx context.Context) error {
 func (c *conn) negotiateTLS(ctx context.Context) error {
 	request := make([]byte, 8)
 	binary.BigEndian.PutUint32(request[0:4], 8)
-	binary.BigEndian.PutUint32(request[4:8], uint32(sslRequestCode))
+	binary.BigEndian.PutUint32(request[4:8], uint32(proto.SSLRequestCode))
 	if _, err := c.netConn.Write(request); err != nil {
 		return err
 	}
@@ -230,7 +232,7 @@ func (c *conn) negotiateTLS(ctx context.Context) error {
 
 // startupFrame builds the protocol 3.51 StartupMessage.
 func startupFrame(cfg *Config) []byte {
-	body := binary.BigEndian.AppendUint32(nil, uint32(protocolVersion351))
+	body := binary.BigEndian.AppendUint32(nil, uint32(proto.ProtocolVersion351))
 	appendStartupParameter := func(key, value string) {
 		body = append(body, key...)
 		body = append(body, 0)
@@ -263,49 +265,49 @@ func (c *conn) startup(ctx context.Context) error {
 			return &stageError{stageStartup, err}
 		}
 		switch typ {
-		case msgAuthenticationRequest:
-			r := &readBuf{b: body}
-			code := r.int32()
-			if r.err != nil {
-				return &stageError{stageAuthentication, r.err}
+		case proto.MsgAuthenticationRequest:
+			r := &proto.ReadBuf{B: body}
+			code := r.Int32()
+			if r.Err != nil {
+				return &stageError{stageAuthentication, r.Err}
 			}
-			payload, authErr := authResponse(code, r, c.config)
+			payload, authErr := auth.Response(code, r, c.config.User, c.config.Password)
 			if authErr != nil {
 				return &stageError{stageAuthentication, authErr}
 			}
-			if r.err != nil {
-				return &stageError{stageAuthentication, r.err}
+			if r.Err != nil {
+				return &stageError{stageAuthentication, r.Err}
 			}
 			if payload != nil {
-				message := newMessageWriter(msgPasswordMessage)
-				message.bytes(payload)
-				if err := c.sendFrames(message.finish()); err != nil {
+				message := proto.NewMessageWriter(proto.MsgPasswordMessage)
+				message.Bytes(payload)
+				if err := c.sendFrames(message.Finish()); err != nil {
 					return &stageError{stageAuthentication, err}
 				}
 				passwordSent = true
 			}
-		case msgParameterStatus:
+		case proto.MsgParameterStatus:
 			c.storeParameter(body)
-		case msgBackendKeyData:
-			r := &readBuf{b: body}
-			c.backendPID = r.int32()
-			c.backendKey = r.int32()
-			if r.err != nil {
-				return &stageError{stageStartup, r.err}
+		case proto.MsgBackendKeyData:
+			r := &proto.ReadBuf{B: body}
+			c.backendPID = r.Int32()
+			c.backendKey = r.Int32()
+			if r.Err != nil {
+				return &stageError{stageStartup, r.Err}
 			}
-		case msgNoticeResponse, msgNotificationResponse:
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse:
 			// Startup notices and notifications are informational; consume and
 			// continue.
-		case msgErrorResponse:
+		case proto.MsgErrorResponse:
 			stage := stageStartup
 			if passwordSent {
 				stage = stageAuthentication
 			}
 			return &stageError{stage, parseErrorResponse(body)}
-		case msgReadyForQuery:
+		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
 			if c.bad {
-				return &stageError{stageStartup, errMalformedMessage}
+				return &stageError{stageStartup, proto.ErrMalformedMessage}
 			}
 			return nil
 		default:
@@ -315,10 +317,10 @@ func (c *conn) startup(ctx context.Context) error {
 }
 
 func (c *conn) storeParameter(body []byte) {
-	r := &readBuf{b: body}
-	name := r.string()
-	value := r.string()
-	if r.err != nil {
+	r := &proto.ReadBuf{B: body}
+	name := r.String()
+	value := r.String()
+	if r.Err != nil {
 		c.bad = true
 		return
 	}
@@ -329,7 +331,7 @@ func (c *conn) storeParameter(body []byte) {
 }
 
 func (c *conn) recv() (byte, []byte, error) {
-	typ, body, err := readMessage(c.br)
+	typ, body, err := proto.ReadMessage(c.br)
 	if err != nil {
 		c.bad = true
 	}
@@ -355,7 +357,7 @@ func (c *conn) setTxnStatus(body []byte) {
 		return
 	}
 	switch status := body[0]; status {
-	case txnIdle, txnInTransaction, txnFailed:
+	case proto.TxnIdle, proto.TxnInTransaction, proto.TxnFailed:
 		c.txnStatus = status
 	default:
 		c.bad = true

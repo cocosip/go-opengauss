@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"github.com/cocosip/go-opengauss/internal/proto"
 	"strings"
 )
 
@@ -26,7 +27,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	if c.bad {
 		return nil, driver.ErrBadConn
 	}
-	if c.txnStatus != txnIdle {
+	if c.txnStatus != proto.TxnIdle {
 		c.bad = true
 		return nil, errors.New("opengauss: cannot begin a transaction on a connection that is already in one")
 	}
@@ -43,7 +44,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 		c.bad = true
 		return nil, fmt.Errorf("opengauss: unexpected command tag %q after %q", tag, statement)
 	}
-	if c.txnStatus != txnInTransaction {
+	if c.txnStatus != proto.TxnInTransaction {
 		c.bad = true
 		return nil, fmt.Errorf("opengauss: server did not report an open transaction after %q", statement)
 	}
@@ -87,7 +88,7 @@ func (t *tx) Commit() error {
 	}
 	tag, err := t.conn.simpleExec(context.Background(), "COMMIT")
 	if err != nil {
-		if t.conn.txnStatus != txnIdle {
+		if t.conn.txnStatus != proto.TxnIdle {
 			t.conn.bad = true
 		}
 		return err
@@ -99,7 +100,7 @@ func (t *tx) Commit() error {
 		t.conn.bad = true
 		return fmt.Errorf("opengauss: unexpected command tag %q after COMMIT", tag)
 	}
-	if t.conn.txnStatus != txnIdle {
+	if t.conn.txnStatus != proto.TxnIdle {
 		t.conn.bad = true
 		return errors.New("opengauss: server did not report the transaction as closed after COMMIT")
 	}
@@ -115,7 +116,7 @@ func (t *tx) Rollback() error {
 	if t.conn.bad {
 		return driver.ErrBadConn
 	}
-	if t.conn.txnStatus == txnIdle {
+	if t.conn.txnStatus == proto.TxnIdle {
 		// A previous statement already ended the transaction.
 		return nil
 	}

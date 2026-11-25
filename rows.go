@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
+	"github.com/cocosip/go-opengauss/internal/proto"
 	"io"
 )
 
@@ -65,22 +66,22 @@ func (r *rows) Next(dest []driver.Value) error {
 			return err
 		}
 		switch typ {
-		case msgDataRow:
+		case proto.MsgDataRow:
 			if err := r.scanRow(body, dest); err != nil {
 				r.done = true
 				r.finish()
 				return err
 			}
 			return nil
-		case msgCommandComplete:
+		case proto.MsgCommandComplete:
 			// The command tag is only needed by Exec; keep reading until the
 			// server marks the session ready.
-		case msgReadyForQuery:
+		case proto.MsgReadyForQuery:
 			r.conn.setTxnStatus(body)
 			r.done = true
 			r.finish()
 			return io.EOF
-		case msgErrorResponse:
+		case proto.MsgErrorResponse:
 			serverErr := parseErrorResponse(body)
 			r.done = true
 			drainErr := r.conn.drainUntilReady()
@@ -93,9 +94,9 @@ func (r *rows) Next(dest []driver.Value) error {
 				return drainErr
 			}
 			return serverErr
-		case msgNoticeResponse, msgNotificationResponse, msgParameterStatus:
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
 			// Asynchronous messages carry no column data.
-		case msgCopyInResponse, msgCopyOutResponse, msgCopyBothResponse:
+		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
 			r.conn.bad = true
 			r.done = true
 			r.finish()
@@ -114,29 +115,29 @@ func (r *rows) scanRow(body []byte, dest []driver.Value) error {
 		r.conn.bad = true
 		return fmt.Errorf("opengauss: row has %d columns but the destination has %d", len(r.columns), len(dest))
 	}
-	rb := &readBuf{b: body}
-	count := int(rb.int16())
-	if rb.err != nil || count != len(r.columns) {
+	rb := &proto.ReadBuf{B: body}
+	count := int(rb.Int16())
+	if rb.Err != nil || count != len(r.columns) {
 		r.conn.bad = true
 		return fmt.Errorf("opengauss: malformed DataRow for %d columns", len(r.columns))
 	}
 	for i := 0; i < count; i++ {
-		length := rb.int32()
-		if rb.err != nil {
+		length := rb.Int32()
+		if rb.Err != nil {
 			break
 		}
 		if length < 0 {
 			dest[i] = nil
 			continue
 		}
-		dest[i] = rb.bytes(int(length))
-		if rb.err != nil {
+		dest[i] = rb.Bytes(int(length))
+		if rb.Err != nil {
 			break
 		}
 	}
-	if rb.err != nil {
+	if rb.Err != nil {
 		r.conn.bad = true
-		return rb.err
+		return rb.Err
 	}
 	return nil
 }
@@ -145,28 +146,28 @@ func (r *rows) scanRow(body []byte, dest []driver.Value) error {
 // fields describe types and formats that the text-only first milestone does not
 // use; they are consumed here so the cursor stays aligned.
 func parseRowDescription(body []byte) ([]string, error) {
-	r := &readBuf{b: body}
-	count := int(r.int16())
+	r := &proto.ReadBuf{B: body}
+	count := int(r.Int16())
 	// A negative count means the 16-bit field exceeded math.MaxInt16, and a
 	// count larger than the remaining bytes cannot describe real columns.
-	if r.err != nil || count < 0 || count > r.remaining() {
-		return nil, errMalformedMessage
+	if r.Err != nil || count < 0 || count > r.Remaining() {
+		return nil, proto.ErrMalformedMessage
 	}
 	names := make([]string, 0, count)
 	for i := 0; i < count; i++ {
-		names = append(names, r.string())
-		r.int32() // table OID
-		r.int16() // attribute number
-		r.int32() // data type OID
-		r.int16() // data type size
-		r.int32() // type modifier
-		r.int16() // format code
-		if r.err != nil {
-			return nil, errMalformedMessage
+		names = append(names, r.String())
+		r.Int32() // table OID
+		r.Int16() // attribute number
+		r.Int32() // data type OID
+		r.Int16() // data type size
+		r.Int32() // type modifier
+		r.Int16() // format code
+		if r.Err != nil {
+			return nil, proto.ErrMalformedMessage
 		}
 	}
-	if r.err != nil {
-		return nil, errMalformedMessage
+	if r.Err != nil {
+		return nil, proto.ErrMalformedMessage
 	}
 	return names, nil
 }

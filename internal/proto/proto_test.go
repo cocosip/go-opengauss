@@ -1,4 +1,4 @@
-package opengauss
+package proto
 
 import (
 	"bufio"
@@ -10,9 +10,9 @@ import (
 )
 
 func TestMessageWriterFramesQuery(t *testing.T) {
-	w := newMessageWriter(msgQuery)
-	w.string("SELECT 1")
-	frame := w.finish()
+	w := NewMessageWriter(MsgQuery)
+	w.String("SELECT 1")
+	frame := w.Finish()
 
 	want := []byte{'Q', 0, 0, 0, 13, 'S', 'E', 'L', 'E', 'C', 'T', ' ', '1', 0}
 	if !bytes.Equal(frame, want) {
@@ -21,7 +21,7 @@ func TestMessageWriterFramesQuery(t *testing.T) {
 }
 
 func TestMessageWriterFramesEmptyBody(t *testing.T) {
-	frame := newMessageWriter(msgSync).finish()
+	frame := NewMessageWriter(MsgSync).Finish()
 	want := []byte{'S', 0, 0, 0, 4}
 	if !bytes.Equal(frame, want) {
 		t.Fatalf("frame = %v, want %v", frame, want)
@@ -29,25 +29,25 @@ func TestMessageWriterFramesEmptyBody(t *testing.T) {
 }
 
 func TestReadBufStickyError(t *testing.T) {
-	r := &readBuf{b: []byte{0, 0, 0, 7}}
-	if got := r.int32(); got != 7 {
+	r := &ReadBuf{B: []byte{0, 0, 0, 7}}
+	if got := r.Int32(); got != 7 {
 		t.Fatalf("int32 = %d, want 7", got)
 	}
-	if r.err != nil {
-		t.Fatalf("unexpected error after valid read: %v", r.err)
+	if r.Err != nil {
+		t.Fatalf("unexpected error after valid read: %v", r.Err)
 	}
-	r.int16()
-	if r.err == nil {
+	r.Int16()
+	if r.Err == nil {
 		t.Fatal("reading past the end must set the sticky error")
 	}
 }
 
 func TestReadBufStringNeedsTerminator(t *testing.T) {
-	r := &readBuf{b: []byte("abc")}
-	if got := r.string(); got != "" {
+	r := &ReadBuf{B: []byte("abc")}
+	if got := r.String(); got != "" {
 		t.Fatalf("string = %q, want empty result on malformed input", got)
 	}
-	if r.err == nil {
+	if r.Err == nil {
 		t.Fatal("missing terminator must set the sticky error")
 	}
 }
@@ -56,14 +56,14 @@ func TestReadMessageSplitAndCoalesced(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
 
-	first := newMessageWriter(msgParameterStatus)
-	first.string("server_version")
-	first.string("7.0.0")
-	firstFrame := first.finish()
+	first := NewMessageWriter(MsgParameterStatus)
+	first.String("server_version")
+	first.String("7.0.0")
+	firstFrame := first.Finish()
 
-	second := newMessageWriter(msgReadyForQuery)
-	second.byte(txnIdle)
-	secondFrame := second.finish()
+	second := NewMessageWriter(MsgReadyForQuery)
+	second.Byte(TxnIdle)
+	secondFrame := second.Finish()
 
 	go func() {
 		defer func() { _ = server.Close() }()
@@ -81,30 +81,30 @@ func TestReadMessageSplitAndCoalesced(t *testing.T) {
 
 	br := bufio.NewReader(client)
 
-	typ, body, err := readMessage(br)
+	typ, body, err := ReadMessage(br)
 	if err != nil {
-		t.Fatalf("readMessage: %v", err)
+		t.Fatalf("ReadMessage: %v", err)
 	}
-	if typ != msgParameterStatus {
-		t.Fatalf("type = %q, want %q", typ, msgParameterStatus)
+	if typ != MsgParameterStatus {
+		t.Fatalf("type = %q, want %q", typ, MsgParameterStatus)
 	}
-	r := &readBuf{b: body}
-	if name, value := r.string(), r.string(); name != "server_version" || value != "7.0.0" {
+	r := &ReadBuf{B: body}
+	if name, value := r.String(), r.String(); name != "server_version" || value != "7.0.0" {
 		t.Fatalf("parameter = %q/%q", name, value)
 	}
-	if r.err != nil {
-		t.Fatalf("parse: %v", r.err)
+	if r.Err != nil {
+		t.Fatalf("parse: %v", r.Err)
 	}
 
 	for i := 0; i < 2; i++ {
-		typ, body, err = readMessage(br)
+		typ, body, err = ReadMessage(br)
 		if err != nil {
-			t.Fatalf("readMessage %d: %v", i, err)
+			t.Fatalf("ReadMessage %d: %v", i, err)
 		}
-		if typ != msgReadyForQuery {
+		if typ != MsgReadyForQuery {
 			t.Fatalf("type = %q, want ReadyForQuery", typ)
 		}
-		if len(body) != 1 || body[0] != txnIdle {
+		if len(body) != 1 || body[0] != TxnIdle {
 			t.Fatalf("body = %v, want idle transaction status", body)
 		}
 	}
@@ -122,7 +122,7 @@ func TestReadMessageRejectsBadLength(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			br := bufio.NewReader(bytes.NewReader(tt.raw))
-			_, _, err := readMessage(br)
+			_, _, err := ReadMessage(br)
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -136,7 +136,7 @@ func TestReadMessageRejectsBadLength(t *testing.T) {
 func TestReadMessageTruncated(t *testing.T) {
 	// Header promises 4 bytes of payload but only 2 arrive.
 	br := bufio.NewReader(bytes.NewReader([]byte{'D', 0, 0, 0, 8, 1, 2}))
-	_, _, err := readMessage(br)
+	_, _, err := ReadMessage(br)
 	if err == nil {
 		t.Fatal("expected an error for a truncated message")
 	}

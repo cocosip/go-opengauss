@@ -1,13 +1,15 @@
 package opengauss
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
+
+	"github.com/cocosip/go-opengauss/internal/pgservicefile"
 )
 
 // applyServiceFile fills parameters that the DSN did not set, using the named
@@ -26,7 +28,7 @@ func applyServiceFile(values map[string]string, service string) error {
 		}
 		return fmt.Errorf("opengauss: read service file %q: %w", path, err)
 	}
-	serviceValues, err := parseServiceFile(data, service)
+	serviceValues, err := pgservicefile.Parse(bytes.NewReader(data), service)
 	if err != nil {
 		return fmt.Errorf("opengauss: service file %q: %w", path, err)
 	}
@@ -50,38 +52,4 @@ func defaultServiceFile() string {
 		return filepath.Join(home, ".pg_service.conf")
 	}
 	return ".pg_service.conf"
-}
-
-// parseServiceFile returns the parameters of the first section named service.
-func parseServiceFile(data []byte, service string) (map[string]string, error) {
-	values := make(map[string]string)
-	matched := false
-	for lineNo, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
-		if strings.HasPrefix(line, "[") {
-			if !strings.HasSuffix(line, "]") {
-				return nil, fmt.Errorf("line %d: malformed section header %q", lineNo+1, line)
-			}
-			if matched {
-				break // libpq stops at the end of the first matching section
-			}
-			matched = strings.TrimSpace(line[1:len(line)-1]) == service
-			continue
-		}
-		if !matched {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			return nil, fmt.Errorf("line %d: expected key=value, got %q", lineNo+1, line)
-		}
-		values[strings.TrimSpace(key)] = strings.TrimSpace(value)
-	}
-	if !matched {
-		return nil, fmt.Errorf("service %q not found", service)
-	}
-	return values, nil
 }

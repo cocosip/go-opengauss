@@ -1,7 +1,8 @@
-package opengauss
+package auth
 
 import (
 	"encoding/binary"
+	"github.com/cocosip/go-opengauss/internal/proto"
 	"strings"
 	"testing"
 )
@@ -116,8 +117,8 @@ func TestMD5PasswordKnownAnswers(t *testing.T) {
 	}
 }
 
-// authSHA256Body builds the body of an AuthenticationSHA256Request.
-func authSHA256Body(stored int32, salt, token string, iteration int32) []byte {
+// RequestSHA256Body builds the body of an AuthenticationSHA256Request.
+func RequestSHA256Body(stored int32, salt, token string, iteration int32) []byte {
 	b := binary.BigEndian.AppendUint32(nil, uint32(stored))
 	b = append(b, salt...)
 	b = append(b, token...)
@@ -131,10 +132,10 @@ const (
 )
 
 func TestAuthResponseSHA256StoredMethods(t *testing.T) {
-	cfg := &Config{User: "alice", Password: "sha256@abc123"}
-	for _, stored := range []int32{passwordStoredPlain, passwordStoredSHA256} {
-		body := authSHA256Body(stored, katSalt, katToken, 10000)
-		payload, err := authResponse(authSHA256, &readBuf{b: body}, cfg)
+	cfg := creds{user: "alice", password: "sha256@abc123"}
+	for _, stored := range []int32{StoredPlain, StoredSHA256} {
+		body := RequestSHA256Body(stored, katSalt, katToken, 10000)
+		payload, err := Response(RequestSHA256, &proto.ReadBuf{B: body}, cfg.user, cfg.password)
 		if err != nil {
 			t.Fatalf("stored method %d: %v", stored, err)
 		}
@@ -146,10 +147,10 @@ func TestAuthResponseSHA256StoredMethods(t *testing.T) {
 }
 
 func TestAuthResponseSHA256StoredMD5(t *testing.T) {
-	cfg := &Config{User: "alice", Password: "alice"}
-	body := binary.BigEndian.AppendUint32(nil, uint32(passwordStoredMD5))
+	cfg := creds{user: "alice", password: "alice"}
+	body := binary.BigEndian.AppendUint32(nil, uint32(StoredMD5))
 	body = append(body, 1, 2, 3, 4)
-	payload, err := authResponse(authSHA256, &readBuf{b: body}, cfg)
+	payload, err := Response(RequestSHA256, &proto.ReadBuf{B: body}, cfg.user, cfg.password)
 	if err != nil {
 		t.Fatalf("authResponse: %v", err)
 	}
@@ -159,34 +160,34 @@ func TestAuthResponseSHA256StoredMD5(t *testing.T) {
 }
 
 func TestAuthResponseSHA256RejectsUnknownStoredMethod(t *testing.T) {
-	cfg := &Config{User: "alice", Password: "pw"}
-	body := authSHA256Body(9, katSalt, katToken, 10000)
-	_, err := authResponse(authSHA256, &readBuf{b: body}, cfg)
+	cfg := creds{user: "alice", password: "pw"}
+	body := RequestSHA256Body(9, katSalt, katToken, 10000)
+	_, err := Response(RequestSHA256, &proto.ReadBuf{B: body}, cfg.user, cfg.password)
 	if err == nil || !strings.Contains(err.Error(), "stored password method") {
 		t.Fatalf("error = %v, want unsupported stored method", err)
 	}
 }
 
 func TestAuthResponseSHA256RejectsMissingPassword(t *testing.T) {
-	body := authSHA256Body(passwordStoredSHA256, katSalt, katToken, 10000)
-	_, err := authResponse(authSHA256, &readBuf{b: body}, &Config{User: "alice"})
+	body := RequestSHA256Body(StoredSHA256, katSalt, katToken, 10000)
+	_, err := Response(RequestSHA256, &proto.ReadBuf{B: body}, "alice", "")
 	if err == nil || !strings.Contains(err.Error(), "password") {
 		t.Fatalf("error = %v, want a missing-password error", err)
 	}
 }
 
 func TestAuthResponseSHA256RejectsTruncatedBody(t *testing.T) {
-	body := binary.BigEndian.AppendUint32(nil, uint32(passwordStoredSHA256))
-	_, err := authResponse(authSHA256, &readBuf{b: body}, &Config{User: "alice", Password: "pw"})
+	body := binary.BigEndian.AppendUint32(nil, uint32(StoredSHA256))
+	_, err := Response(RequestSHA256, &proto.ReadBuf{B: body}, "alice", "pw")
 	if err == nil {
 		t.Fatal("expected an error for a truncated authentication request")
 	}
 }
 
 func TestAuthResponseOtherMethods(t *testing.T) {
-	cfg := &Config{User: "alice", Password: "alice"}
+	cfg := creds{user: "alice", password: "alice"}
 
-	payload, err := authResponse(authCleartextPassword, &readBuf{}, cfg)
+	payload, err := Response(RequestCleartext, &proto.ReadBuf{}, cfg.user, cfg.password)
 	if err != nil {
 		t.Fatalf("cleartext: %v", err)
 	}
@@ -194,7 +195,7 @@ func TestAuthResponseOtherMethods(t *testing.T) {
 		t.Errorf("cleartext payload = %q", payload)
 	}
 
-	payload, err = authResponse(authMD5Password, &readBuf{b: []byte{1, 2, 3, 4}}, cfg)
+	payload, err = Response(RequestMD5, &proto.ReadBuf{B: []byte{1, 2, 3, 4}}, cfg.user, cfg.password)
 	if err != nil {
 		t.Fatalf("md5: %v", err)
 	}
@@ -202,7 +203,7 @@ func TestAuthResponseOtherMethods(t *testing.T) {
 		t.Errorf("md5 payload = %q, want %q", payload, want)
 	}
 
-	payload, err = authResponse(authOK, &readBuf{}, cfg)
+	payload, err = Response(OK, &proto.ReadBuf{}, cfg.user, cfg.password)
 	if err != nil || payload != nil {
 		t.Fatalf("AuthenticationOk = %q/%v, want no payload", payload, err)
 	}
@@ -213,17 +214,17 @@ func TestAuthResponseUnsupportedMethods(t *testing.T) {
 		code    int32
 		wantSub string
 	}{
-		{authGSS, "GSSAPI"},
-		{authGSSContinue, "GSSAPI"},
-		{authSSPI, "SSPI"},
-		{authMD5SHA256, "MD5-SHA256"},
-		{authLiteSHA256, "Lite SHA256_RFC"},
-		{authSM3, "SM3"},
+		{RequestGSS, "GSSAPI"},
+		{RequestGSSContinue, "GSSAPI"},
+		{RequestSSPI, "SSPI"},
+		{RequestMD5SHA256, "MD5-SHA256"},
+		{RequestLiteSHA256, "Lite SHA256_RFC"},
+		{RequestSM3, "SM3"},
 		{99, "request 99"},
 	}
 	for _, tt := range tests {
-		t.Run(authMethodName(tt.code), func(t *testing.T) {
-			_, err := authResponse(tt.code, &readBuf{}, &Config{User: "alice", Password: "alice"})
+		t.Run(methodName(tt.code), func(t *testing.T) {
+			_, err := Response(tt.code, &proto.ReadBuf{}, "alice", "alice")
 			if err == nil {
 				t.Fatal("expected an unsupported-method error")
 			}
@@ -236,3 +237,5 @@ func TestAuthResponseUnsupportedMethods(t *testing.T) {
 		})
 	}
 }
+
+type creds struct{ user, password string }

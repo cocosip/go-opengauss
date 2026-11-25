@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"github.com/cocosip/go-opengauss/internal/auth"
+	"github.com/cocosip/go-opengauss/internal/proto"
 	"io"
 	"net"
 	"sync"
@@ -13,8 +15,11 @@ import (
 )
 
 // Credentials used by the scripted peer. The password matches the published
-// SHA256 known-answer vector in auth_test.go.
+// SHA256 known-answer vector in internal/auth.
 const (
+	katSalt      = "3458fe51abe962f7b6011a1d73fc14edf50539fae89fb9dda75fbb642d9859bf"
+	katToken     = "2cf71f10"
+	katProof     = "f5213af93974ae3f0a3eedba7b0ef27796bcd4d84bb737d9c35fce54fcfe28fd"
 	testUser     = "alice"
 	testDatabase = "app"
 	testPassword = "sha256@abc123"
@@ -149,21 +154,21 @@ func (s *fakeSession) readStartup() map[string]string {
 	if body == nil {
 		return nil
 	}
-	r := &readBuf{b: body}
-	version := r.int32()
-	if version != protocolVersion351 {
-		s.fail("startup protocol version = %d, want %d", version, protocolVersion351)
+	r := &proto.ReadBuf{B: body}
+	version := r.Int32()
+	if version != proto.ProtocolVersion351 {
+		s.fail("startup protocol version = %d, want %d", version, proto.ProtocolVersion351)
 	}
 	params := make(map[string]string)
-	for r.remaining() > 0 {
-		key := r.string()
+	for r.Remaining() > 0 {
+		key := r.String()
 		if key == "" {
 			break
 		}
-		params[key] = r.string()
+		params[key] = r.String()
 	}
-	if r.err != nil {
-		s.fail("malformed startup message: %v", r.err)
+	if r.Err != nil {
+		s.fail("malformed startup message: %v", r.Err)
 	}
 	return params
 }
@@ -176,7 +181,7 @@ func (s *fakeSession) rejectTLS() {
 	}
 	length := int(binary.BigEndian.Uint32(raw))
 	body := s.readN(length - 4)
-	if len(body) != 4 || int32(binary.BigEndian.Uint32(body)) != sslRequestCode {
+	if len(body) != 4 || int32(binary.BigEndian.Uint32(body)) != proto.SSLRequestCode {
 		s.fail("expected SSLRequest, got body %x", body)
 		return
 	}
@@ -193,7 +198,7 @@ func (s *fakeSession) acceptTLS(cert tls.Certificate) bool {
 	}
 	length := int(binary.BigEndian.Uint32(raw))
 	body := s.readN(length - 4)
-	if len(body) != 4 || int32(binary.BigEndian.Uint32(body)) != sslRequestCode {
+	if len(body) != 4 || int32(binary.BigEndian.Uint32(body)) != proto.SSLRequestCode {
 		s.fail("expected SSLRequest, got body %x", body)
 		return false
 	}
@@ -210,30 +215,30 @@ func (s *fakeSession) acceptTLS(cert tls.Certificate) bool {
 }
 
 func (s *fakeSession) expectPassword() []byte {
-	return s.expectType(msgPasswordMessage)
+	return s.expectType(proto.MsgPasswordMessage)
 }
 
 func (s *fakeSession) expectSimpleQuery() string {
-	body := s.expectType(msgQuery)
-	r := &readBuf{b: body}
-	query := r.string()
-	if r.err != nil {
-		s.fail("malformed Query message: %v", r.err)
+	body := s.expectType(proto.MsgQuery)
+	r := &proto.ReadBuf{B: body}
+	query := r.String()
+	if r.Err != nil {
+		s.fail("malformed Query message: %v", r.Err)
 	}
 	return query
 }
 
 func (s *fakeSession) expectPrepare() (name, query string) {
-	body := s.expectType(msgParse)
-	r := &readBuf{b: body}
-	name = r.string()
-	query = r.string()
-	paramTypes := int(r.int16())
+	body := s.expectType(proto.MsgParse)
+	r := &proto.ReadBuf{B: body}
+	name = r.String()
+	query = r.String()
+	paramTypes := int(r.Int16())
 	for i := 0; i < paramTypes; i++ {
-		r.int32()
+		r.Int32()
 	}
-	if r.err != nil {
-		s.fail("malformed Parse message: %v", r.err)
+	if r.Err != nil {
+		s.fail("malformed Parse message: %v", r.Err)
 	}
 	return name, query
 }
@@ -255,43 +260,43 @@ func (s *fakeSession) expectExtended() (query string, args []fakeParam) {
 // expectBindExecute reads Bind, Describe, Execute and Sync for a prepared
 // statement.
 func (s *fakeSession) expectBindExecute() (statement string, args []fakeParam) {
-	bind := s.expectType(msgBind)
-	rb := &readBuf{b: bind}
-	rb.string() // portal
-	statement = rb.string()
-	formatCount := int(rb.int16())
+	bind := s.expectType(proto.MsgBind)
+	rb := &proto.ReadBuf{B: bind}
+	_ = rb.String() // portal
+	statement = rb.String()
+	formatCount := int(rb.Int16())
 	for i := 0; i < formatCount; i++ {
-		rb.int16()
+		rb.Int16()
 	}
-	paramCount := int(rb.int16())
+	paramCount := int(rb.Int16())
 	args = make([]fakeParam, paramCount)
 	for i := 0; i < paramCount; i++ {
-		length := int(rb.int32())
+		length := int(rb.Int32())
 		if length < 0 {
 			args[i] = fakeParam{isNull: true}
 			continue
 		}
-		args[i] = fakeParam{text: string(rb.bytes(length))}
+		args[i] = fakeParam{text: string(rb.Bytes(length))}
 	}
-	resultFormats := int(rb.int16())
+	resultFormats := int(rb.Int16())
 	for i := 0; i < resultFormats; i++ {
-		rb.int16()
+		rb.Int16()
 	}
-	if rb.err != nil {
-		s.fail("malformed Bind message: %v", rb.err)
+	if rb.Err != nil {
+		s.fail("malformed Bind message: %v", rb.Err)
 	}
 
-	describe := s.expectType(msgDescribe)
-	dr := &readBuf{b: describe}
-	if target := dr.byte(); target != 'P' {
+	describe := s.expectType(proto.MsgDescribe)
+	dr := &proto.ReadBuf{B: describe}
+	if target := dr.Byte(); target != 'P' {
 		s.fail("Describe target = %q, want portal", target)
 	}
-	dr.string()
-	execute := s.expectType(msgExecute)
-	er := &readBuf{b: execute}
-	er.string() // portal
-	er.int32()  // row limit
-	s.expectType(msgSync)
+	_ = dr.String()
+	execute := s.expectType(proto.MsgExecute)
+	er := &proto.ReadBuf{B: execute}
+	_ = er.String() // portal
+	er.Int32()      // row limit
+	s.expectType(proto.MsgSync)
 	return statement, args
 }
 
@@ -312,24 +317,24 @@ func (s *fakeSession) completeStartup(check func(params map[string]string)) {
 	s.sendParameterStatus("client_encoding", "UTF8")
 	s.sendBackendKeyData(4242, 9001)
 	s.sendNotice("intervening notice must be consumed")
-	s.sendReady(txnIdle)
+	s.sendReady(proto.TxnIdle)
 }
 
 func (s *fakeSession) sendAuthenticationSHA256(salt, token string, iteration int32) {
-	m := newMessageWriter(msgAuthenticationRequest)
-	m.int32(authSHA256)
-	m.int32(passwordStoredSHA256)
-	m.bytes([]byte(salt))
-	m.bytes([]byte(token))
-	m.int32(iteration)
-	s.writeRaw(m.finish())
+	m := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+	m.Int32(auth.RequestSHA256)
+	m.Int32(auth.StoredSHA256)
+	m.Bytes([]byte(salt))
+	m.Bytes([]byte(token))
+	m.Int32(iteration)
+	s.writeRaw(m.Finish())
 }
 
 func (s *fakeSession) sendAuthenticationMD5(salt []byte) {
-	m := newMessageWriter(msgAuthenticationRequest)
-	m.int32(authMD5Password)
-	m.bytes(salt)
-	s.writeRaw(m.finish())
+	m := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+	m.Int32(auth.RequestMD5)
+	m.Bytes(salt)
+	s.writeRaw(m.Finish())
 }
 
 func (s *fakeSession) sendAuthenticationOK() {
@@ -338,59 +343,59 @@ func (s *fakeSession) sendAuthenticationOK() {
 
 // authOKFrame builds the AuthenticationOk message.
 func authOKFrame() []byte {
-	m := newMessageWriter(msgAuthenticationRequest)
-	m.int32(authOK)
-	return m.finish()
+	m := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+	m.Int32(auth.OK)
+	return m.Finish()
 }
 
 // parameterStatusFrame builds one ParameterStatus message.
 func parameterStatusFrame(name, value string) []byte {
-	m := newMessageWriter(msgParameterStatus)
-	m.string(name)
-	m.string(value)
-	return m.finish()
+	m := proto.NewMessageWriter(proto.MsgParameterStatus)
+	m.String(name)
+	m.String(value)
+	return m.Finish()
 }
 
 func (s *fakeSession) sendAuthenticationRequest(code int32) {
-	m := newMessageWriter(msgAuthenticationRequest)
-	m.int32(code)
-	s.writeRaw(m.finish())
+	m := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+	m.Int32(code)
+	s.writeRaw(m.Finish())
 }
 
 func (s *fakeSession) sendParameterStatus(name, value string) {
-	m := newMessageWriter(msgParameterStatus)
-	m.string(name)
-	m.string(value)
-	s.writeRaw(m.finish())
+	m := proto.NewMessageWriter(proto.MsgParameterStatus)
+	m.String(name)
+	m.String(value)
+	s.writeRaw(m.Finish())
 }
 
 func (s *fakeSession) sendBackendKeyData(pid, key int32) {
-	m := newMessageWriter(msgBackendKeyData)
-	m.int32(pid)
-	m.int32(key)
-	s.writeRaw(m.finish())
+	m := proto.NewMessageWriter(proto.MsgBackendKeyData)
+	m.Int32(pid)
+	m.Int32(key)
+	s.writeRaw(m.Finish())
 }
 
 func (s *fakeSession) sendNotice(message string) {
-	m := newMessageWriter(msgNoticeResponse)
-	m.byte('S')
-	m.string("NOTICE")
-	m.byte('M')
-	m.string(message)
-	m.byte(0)
-	s.writeRaw(m.finish())
+	m := proto.NewMessageWriter(proto.MsgNoticeResponse)
+	m.Byte('S')
+	m.String("NOTICE")
+	m.Byte('M')
+	m.String(message)
+	m.Byte(0)
+	s.writeRaw(m.Finish())
 }
 
 func (s *fakeSession) sendError(sqlstate, message string) {
-	m := newMessageWriter(msgErrorResponse)
-	m.byte('S')
-	m.string("ERROR")
-	m.byte('C')
-	m.string(sqlstate)
-	m.byte('M')
-	m.string(message)
-	m.byte(0)
-	s.writeRaw(m.finish())
+	m := proto.NewMessageWriter(proto.MsgErrorResponse)
+	m.Byte('S')
+	m.String("ERROR")
+	m.Byte('C')
+	m.String(sqlstate)
+	m.Byte('M')
+	m.String(message)
+	m.Byte(0)
+	s.writeRaw(m.Finish())
 }
 
 func (s *fakeSession) sendReady(status byte) {
@@ -399,68 +404,74 @@ func (s *fakeSession) sendReady(status byte) {
 
 // Frame builders. They are also used by tests that split or coalesce writes.
 func readyFrame(status byte) []byte {
-	m := newMessageWriter(msgReadyForQuery)
-	m.byte(status)
-	return m.finish()
+	m := proto.NewMessageWriter(proto.MsgReadyForQuery)
+	m.Byte(status)
+	return m.Finish()
 }
 
 func commandCompleteFrame(tag string) []byte {
-	m := newMessageWriter(msgCommandComplete)
-	m.string(tag)
-	return m.finish()
+	m := proto.NewMessageWriter(proto.MsgCommandComplete)
+	m.String(tag)
+	return m.Finish()
 }
 
 func rowDescriptionFrame(columns ...fakeColumn) []byte {
-	m := newMessageWriter(msgRowDescription)
-	m.int16(int16(len(columns)))
+	m := proto.NewMessageWriter(proto.MsgRowDescription)
+	m.Int16(int16(len(columns)))
 	for _, col := range columns {
-		m.string(col.name)
-		m.int32(0) // table OID
-		m.int16(0) // attribute number
-		m.int32(col.oid)
-		m.int16(-1) // type size
-		m.int32(-1) // type modifier
-		m.int16(0)  // text format
+		m.String(col.name)
+		m.Int32(0) // table OID
+		m.Int16(0) // attribute number
+		m.Int32(col.oid)
+		m.Int16(-1) // type size
+		m.Int32(-1) // type modifier
+		m.Int16(0)  // text format
 	}
-	return m.finish()
+	return m.Finish()
 }
 
 // dataRowFrame encodes one DataRow. A nil element is SQL NULL.
 func dataRowFrame(values ...any) []byte {
-	m := newMessageWriter(msgDataRow)
-	m.int16(int16(len(values)))
+	m := proto.NewMessageWriter(proto.MsgDataRow)
+	m.Int16(int16(len(values)))
 	for _, value := range values {
 		switch v := value.(type) {
 		case nil:
-			m.int32(-1)
+			m.Int32(-1)
 		case string:
-			m.int32(int32(len(v)))
-			m.bytes([]byte(v))
+			m.Int32(int32(len(v)))
+			m.Bytes([]byte(v))
 		case []byte:
-			m.int32(int32(len(v)))
-			m.bytes(v)
+			m.Int32(int32(len(v)))
+			m.Bytes(v)
 		default:
 			return nil
 		}
 	}
-	return m.finish()
+	return m.Finish()
 }
 
-func (s *fakeSession) sendParseComplete() { s.writeRaw(newMessageWriter(msgParseComplete).finish()) }
-func (s *fakeSession) sendBindComplete()  { s.writeRaw(newMessageWriter(msgBindComplete).finish()) }
-func (s *fakeSession) sendCloseComplete() { s.writeRaw(newMessageWriter(msgCloseComplete).finish()) }
-func (s *fakeSession) sendNoData()        { s.writeRaw(newMessageWriter(msgNoData).finish()) }
+func (s *fakeSession) sendParseComplete() {
+	s.writeRaw(proto.NewMessageWriter(proto.MsgParseComplete).Finish())
+}
+func (s *fakeSession) sendBindComplete() {
+	s.writeRaw(proto.NewMessageWriter(proto.MsgBindComplete).Finish())
+}
+func (s *fakeSession) sendCloseComplete() {
+	s.writeRaw(proto.NewMessageWriter(proto.MsgCloseComplete).Finish())
+}
+func (s *fakeSession) sendNoData() { s.writeRaw(proto.NewMessageWriter(proto.MsgNoData).Finish()) }
 func (s *fakeSession) sendEmptyQueryResponse() {
-	s.writeRaw(newMessageWriter(msgEmptyQueryResponse).finish())
+	s.writeRaw(proto.NewMessageWriter(proto.MsgEmptyQueryResponse).Finish())
 }
 
 func (s *fakeSession) sendParameterDescription(oids ...int32) {
-	m := newMessageWriter(msgParameterDescription)
-	m.int16(int16(len(oids)))
+	m := proto.NewMessageWriter(proto.MsgParameterDescription)
+	m.Int16(int16(len(oids)))
 	for _, oid := range oids {
-		m.int32(oid)
+		m.Int32(oid)
 	}
-	s.writeRaw(m.finish())
+	s.writeRaw(m.Finish())
 }
 
 // fakeColumn is one RowDescription column.

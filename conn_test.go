@@ -13,6 +13,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/cocosip/go-opengauss/internal/auth"
+	"github.com/cocosip/go-opengauss/internal/proto"
 	"math/big"
 	"net"
 	"os"
@@ -55,7 +57,7 @@ func TestSQLOpenPingAndSimpleQuery(t *testing.T) {
 			s.fail("ping used query %q, want the empty statement", query)
 		}
 		s.sendEmptyQueryResponse()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 
 		if query := s.expectSimpleQuery(); query != "SELECT 1" {
 			s.fail("query = %q, want SELECT 1", query)
@@ -63,7 +65,7 @@ func TestSQLOpenPingAndSimpleQuery(t *testing.T) {
 		s.sendRowDescription(fakeColumn{name: "?column?", oid: 23})
 		s.sendDataRow("1")
 		s.sendCommandComplete("SELECT 1")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -116,7 +118,7 @@ func TestStartupKeepsSessionState(t *testing.T) {
 	if physical.backendPID != 4242 || physical.backendKey != 9001 {
 		t.Errorf("backend key = %d/%d, want 4242/9001", physical.backendPID, physical.backendKey)
 	}
-	if physical.txnStatus != txnIdle {
+	if physical.txnStatus != proto.TxnIdle {
 		t.Errorf("transaction status = %q, want idle", physical.txnStatus)
 	}
 }
@@ -137,7 +139,7 @@ func TestBoundIntegerParameter(t *testing.T) {
 		s.sendRowDescription(fakeColumn{name: "int4", oid: 23})
 		s.sendDataRow("42")
 		s.sendCommandComplete("SELECT 1")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -161,19 +163,19 @@ func TestPreparedStatementExec(t *testing.T) {
 		if name == "" {
 			s.fail("prepared statement name is empty")
 		}
-		describe := s.expectType(msgDescribe)
-		dr := &readBuf{b: describe}
-		if target := dr.byte(); target != 'S' {
+		describe := s.expectType(proto.MsgDescribe)
+		dr := &proto.ReadBuf{B: describe}
+		if target := dr.Byte(); target != 'S' {
 			s.fail("Describe target = %q, want statement", target)
 		}
-		if described := dr.string(); described != name {
+		if described := dr.String(); described != name {
 			s.fail("described statement = %q, want %q", described, name)
 		}
-		s.expectType(msgSync)
+		s.expectType(proto.MsgSync)
 		s.sendParseComplete()
 		s.sendParameterDescription(23)
 		s.sendNoData()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 
 		statement, args := s.expectBindExecute()
 		if statement != name {
@@ -185,18 +187,18 @@ func TestPreparedStatementExec(t *testing.T) {
 		s.sendBindComplete()
 		s.sendNoData()
 		s.sendCommandComplete("INSERT 0 1")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 
-		closeBody := s.expectType(msgClose)
-		closer := &readBuf{b: closeBody}
-		if target := closer.byte(); target != 'S' {
+		closeBody := s.expectType(proto.MsgClose)
+		closer := &proto.ReadBuf{B: closeBody}
+		if target := closer.Byte(); target != 'S' {
 			s.fail("Close target = %q, want statement", target)
 		}
-		if closed := closer.string(); closed != name {
+		if closed := closer.String(); closed != name {
 			s.fail("closed statement = %q, want %q", closed, name)
 		}
 		s.sendCloseComplete()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -230,19 +232,19 @@ func TestTransactionRollbackAndReuse(t *testing.T) {
 			s.fail("begin query = %q", query)
 		}
 		s.sendCommandComplete("BEGIN")
-		s.sendReady(txnInTransaction)
+		s.sendReady(proto.TxnInTransaction)
 
 		if query := s.expectSimpleQuery(); query != "INSERT INTO t VALUES (1)" {
 			s.fail("insert query = %q", query)
 		}
 		s.sendCommandComplete("INSERT 0 1")
-		s.sendReady(txnInTransaction)
+		s.sendReady(proto.TxnInTransaction)
 
 		if query := s.expectSimpleQuery(); query != "ROLLBACK" {
 			s.fail("rollback query = %q", query)
 		}
 		s.sendCommandComplete("ROLLBACK")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 
 		if query := s.expectSimpleQuery(); query != "SELECT count(*) FROM t" {
 			s.fail("count query = %q", query)
@@ -250,7 +252,7 @@ func TestTransactionRollbackAndReuse(t *testing.T) {
 		s.sendRowDescription(fakeColumn{name: "count", oid: 20})
 		s.sendDataRow("0")
 		s.sendCommandComplete("SELECT 1")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -288,7 +290,7 @@ func TestServerErrorPreservesSQLStateAndReuse(t *testing.T) {
 			s.fail("query = %q", query)
 		}
 		s.sendError("42P01", `relation "missing" does not exist`)
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 
 		if query := s.expectSimpleQuery(); query != "SELECT 1" {
 			s.fail("follow-up query = %q", query)
@@ -296,7 +298,7 @@ func TestServerErrorPreservesSQLStateAndReuse(t *testing.T) {
 		s.sendRowDescription(fakeColumn{name: "?column?", oid: 23})
 		s.sendDataRow("1")
 		s.sendCommandComplete("SELECT 1")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -382,7 +384,7 @@ func TestFailedConnectLeavesPoolEmpty(t *testing.T) {
 func TestUnsupportedAuthenticationMethod(t *testing.T) {
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.readStartup()
-		s.sendAuthenticationRequest(authGSS)
+		s.sendAuthenticationRequest(auth.RequestGSS)
 	})
 
 	connector, err := NewConnector(testDSN(server, ""))
@@ -412,7 +414,7 @@ func TestMD5Authentication(t *testing.T) {
 			s.fail("MD5 proof = %q, want %q", proof, want)
 		}
 		s.sendAuthenticationOK()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=alice password=alice dbname=app sslmode=disable", server.port())
@@ -461,7 +463,7 @@ func TestEarlyRowsCloseResynchronizes(t *testing.T) {
 		s.sendDataRow("1")
 		s.sendDataRow("2")
 		s.sendCommandComplete("SELECT 2")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 
 		if query := s.expectSimpleQuery(); query != "SELECT 1" {
 			s.fail("follow-up query = %q", query)
@@ -469,7 +471,7 @@ func TestEarlyRowsCloseResynchronizes(t *testing.T) {
 		s.sendRowDescription(fakeColumn{name: "?column?", oid: 23})
 		s.sendDataRow("1")
 		s.sendCommandComplete("SELECT 1")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -521,7 +523,7 @@ func TestSplitAndCoalescedServerMessages(t *testing.T) {
 		coalesced := append(append(append([]byte{},
 			dataRowFrame("42")...),
 			commandCompleteFrame("SELECT 1")...),
-			readyFrame(txnIdle)...)
+			readyFrame(proto.TxnIdle)...)
 		s.writeRaw(coalesced)
 
 		if query := s.expectSimpleQuery(); query != "SELECT 7" {
@@ -530,7 +532,7 @@ func TestSplitAndCoalescedServerMessages(t *testing.T) {
 		s.sendRowDescription(fakeColumn{name: "x", oid: 23})
 		s.sendDataRow("7")
 		s.sendCommandComplete("SELECT 1")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -565,7 +567,7 @@ func TestTLSVerifyFull(t *testing.T) {
 			s.fail("ping query = %q", query)
 		}
 		s.sendEmptyQueryResponse()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, "sslmode=verify-full sslrootcert="+filepath.ToSlash(rootCert)))
@@ -629,19 +631,19 @@ func TestPreparedStatementHonorsContextDeadline(t *testing.T) {
 		s.completeStartup(nil)
 
 		name, _ := s.expectPrepare()
-		describe := s.expectType(msgDescribe)
-		dr := &readBuf{b: describe}
-		if target := dr.byte(); target != 'S' {
+		describe := s.expectType(proto.MsgDescribe)
+		dr := &proto.ReadBuf{B: describe}
+		if target := dr.Byte(); target != 'S' {
 			s.fail("Describe target = %q, want statement", target)
 		}
-		if described := dr.string(); described != name {
+		if described := dr.String(); described != name {
 			s.fail("described statement = %q, want %q", described, name)
 		}
-		s.expectType(msgSync)
+		s.expectType(proto.MsgSync)
 		s.sendParseComplete()
 		s.sendParameterDescription()
 		s.sendNoData()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 
 		// Read the execution request but never answer it; the client must give
 		// up when its deadline expires.
@@ -718,7 +720,7 @@ func TestPreferFallsBackToPlaintext(t *testing.T) {
 			s.fail("ping query = %q", query)
 		}
 		s.sendEmptyQueryResponse()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, "sslmode=prefer"))
@@ -756,7 +758,7 @@ func TestAllowRetriesWithTLS(t *testing.T) {
 			s.fail("ping query = %q", query)
 		}
 		s.sendEmptyQueryResponse()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, "sslmode=allow"))
@@ -805,20 +807,20 @@ func TestCommitReportsServerRollback(t *testing.T) {
 			s.fail("begin query = %q", query)
 		}
 		s.sendCommandComplete("BEGIN")
-		s.sendReady(txnInTransaction)
+		s.sendReady(proto.TxnInTransaction)
 
 		if query := s.expectSimpleQuery(); query != "INSERT INTO t VALUES (1)" {
 			s.fail("insert query = %q", query)
 		}
 		s.sendError("23505", "duplicate key value violates unique constraint")
-		s.sendReady(txnFailed)
+		s.sendReady(proto.TxnFailed)
 
 		// A failed transaction answers COMMIT with a ROLLBACK tag.
 		if query := s.expectSimpleQuery(); query != "COMMIT" {
 			s.fail("commit query = %q", query)
 		}
 		s.sendCommandComplete("ROLLBACK")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -849,7 +851,7 @@ func TestScanNullAndEmptyValues(t *testing.T) {
 		s.sendRowDescription(fakeColumn{name: "a", oid: 25}, fakeColumn{name: "b", oid: 25})
 		s.sendDataRow(nil, "")
 		s.sendCommandComplete("SELECT 1")
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -871,13 +873,13 @@ func TestCoalescedStartupMessages(t *testing.T) {
 		s.readStartup()
 
 		// The AuthenticationRequest is split into single-byte writes.
-		auth := newMessageWriter(msgAuthenticationRequest)
-		auth.int32(authSHA256)
-		auth.int32(passwordStoredSHA256)
-		auth.bytes([]byte(katSalt))
-		auth.bytes([]byte(katToken))
-		auth.int32(10000)
-		s.sendSlow(auth.finish())
+		req := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+		req.Int32(auth.RequestSHA256)
+		req.Int32(auth.StoredSHA256)
+		req.Bytes([]byte(katSalt))
+		req.Bytes([]byte(katToken))
+		req.Int32(10000)
+		s.sendSlow(req.Finish())
 
 		proof := s.expectPassword()
 		if want := katProof + "\x00"; string(proof) != want {
@@ -890,14 +892,14 @@ func TestCoalescedStartupMessages(t *testing.T) {
 			authOKFrame()...),
 			parameterStatusFrame("server_version", "7.0.0")...),
 			parameterStatusFrame("client_encoding", "UTF8")...),
-			readyFrame(txnIdle)...)
+			readyFrame(proto.TxnIdle)...)
 		s.writeRaw(coalesced)
 
 		if query := s.expectSimpleQuery(); query != "" {
 			s.fail("ping query = %q", query)
 		}
 		s.sendEmptyQueryResponse()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, ""))
@@ -920,7 +922,7 @@ func TestTLSVerifyCAIgnoresHostname(t *testing.T) {
 			s.fail("ping query = %q", query)
 		}
 		s.sendEmptyQueryResponse()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	db := openTestDB(t, testDSN(server, "sslmode=verify-ca sslrootcert="+filepath.ToSlash(rootCert)))
@@ -948,7 +950,7 @@ func TestPassfilePasswordAuthenticates(t *testing.T) {
 			s.fail("ping query = %q", query)
 		}
 		s.sendEmptyQueryResponse()
-		s.sendReady(txnIdle)
+		s.sendReady(proto.TxnIdle)
 	})
 
 	passfile := writeConfigFile(t, "pgpass", fmt.Sprintf("127.0.0.1:%d:%s:%s:%s\n",
