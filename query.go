@@ -128,18 +128,27 @@ func (c *conn) Ping(ctx context.Context) error {
 	return rows.Close()
 }
 
-// ResetSession discards a connection that is still inside a transaction or in
-// the middle of a COPY stream, so the pool never hands out a session whose
-// protocol state belongs to an abandoned operation.
+// ResetSession discards a connection that must not be reused, so the pool never
+// hands out a session whose protocol state belongs to an abandoned operation.
+// It returns ErrBadConn, the only error database/sql acts on here.
 func (c *conn) ResetSession(context.Context) error {
-	if c.bad {
-		return driver.ErrBadConn
-	}
-	if c.txnStatus != proto.TxnIdle || c.copying {
+	if !c.IsValid() {
 		c.bad = true
 		return driver.ErrBadConn
 	}
 	return nil
+}
+
+// IsValid implements driver.Validator: database/sql asks before returning a
+// connection to the idle pool. A session that saw a protocol failure, holds an
+// undecodable client encoding, has been closed, or still owns a transaction or
+// COPY stream is discarded instead of reused. A server (SQL) error leaves the
+// session valid only when the server reported it idle.
+func (c *conn) IsValid() bool {
+	if c.bad || c.encodingErr != nil || c.netConn == nil {
+		return false
+	}
+	return c.txnStatus == proto.TxnIdle && !c.copying
 }
 
 // Close sends a best-effort Terminate message and closes the socket.

@@ -41,6 +41,7 @@ var (
 	_ driver.QueryerContext     = (*conn)(nil)
 	_ driver.Pinger             = (*conn)(nil)
 	_ driver.SessionResetter    = (*conn)(nil)
+	_ driver.Validator          = (*conn)(nil)
 	_ driver.Stmt               = (*stmt)(nil)
 	_ driver.StmtExecContext    = (*stmt)(nil)
 	_ driver.StmtQueryContext   = (*stmt)(nil)
