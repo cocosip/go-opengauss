@@ -24,6 +24,8 @@ const (
 	Int4        int32 = 23
 	Text        int32 = 25
 	Oid         int32 = 26
+	Raw         int32 = 86
+	Blob        int32 = 88
 	JSON        int32 = 114
 	Float4      int32 = 700
 	Float8      int32 = 701
@@ -52,6 +54,8 @@ var typeNames = map[int32]string{
 	Int4:        "int4",
 	Text:        "text",
 	Oid:         "oid",
+	Raw:         "raw",
+	Blob:        "blob",
 	JSON:        "json",
 	Float4:      "float4",
 	Float8:      "float8",

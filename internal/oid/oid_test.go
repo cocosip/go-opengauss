@@ -103,6 +103,8 @@ func TestTypeName(t *testing.T) {
 		{Int2, "int2"},
 		{Int4, "int4"},
 		{Oid, "oid"},
+		{Raw, "raw"},
+		{Blob, "blob"},
 		{Float4, "float4"},
 		{Float8, "float8"},
 		{Numeric, "numeric"},

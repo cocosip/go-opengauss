@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cocosip/go-opengauss/internal/auth"
+	"github.com/cocosip/go-opengauss/internal/oid"
 	"github.com/cocosip/go-opengauss/internal/proto"
 	"io"
 	"math/big"
@@ -1898,12 +1899,14 @@ func TestUnmappedTypesStayText(t *testing.T) {
 			s.fail("query = %q", query)
 		}
 		s.sendRowDescription(
-			fakeColumn{name: "arr", oid: 1007},     // int4[]
-			fakeColumn{name: "multi", oid: 1009},   // text[]
-			fakeColumn{name: "id", oid: 2950},      // uuid
-			fakeColumn{name: "doc", oid: 3802},     // jsonb
-			fakeColumn{name: "mood", oid: 20000},   // a user-defined enum
-			fakeColumn{name: "domain", oid: 16401}, // a domain over text
+			fakeColumn{name: "arr", oid: 1007},      // int4[]
+			fakeColumn{name: "multi", oid: 1009},    // text[]
+			fakeColumn{name: "id", oid: 2950},       // uuid
+			fakeColumn{name: "doc", oid: 3802},      // jsonb
+			fakeColumn{name: "mood", oid: 20000},    // a user-defined enum
+			fakeColumn{name: "domain", oid: 16401},  // a domain over text
+			fakeColumn{name: "raw", oid: oid.Raw},   // B-compatibility RAW
+			fakeColumn{name: "blob", oid: oid.Blob}, // B-compatibility BLOB
 		)
 		s.sendDataRow(
 			"{1,2,NULL}",
@@ -1912,6 +1915,8 @@ func TestUnmappedTypesStayText(t *testing.T) {
 			`{"k": "v", "n": 1}`,
 			"happy",
 			"domain value",
+			"0a0b0c",
+			"\\xdeadbeef",
 		)
 		s.sendCommandComplete("SELECT 1")
 		s.sendReady(proto.TxnIdle)
@@ -1929,8 +1934,8 @@ func TestUnmappedTypesStayText(t *testing.T) {
 		t.Fatalf("ColumnTypes: %v", err)
 	}
 	for i, columnType := range types {
-		// Only the curated type table names an OID; a type outside it reports
-		// no name, but every one of these columns still scans as text.
+		// Known OIDs are named; a type outside the table reports no name, but
+		// every one of these columns still scans as text.
 		if got := columnType.ScanType(); got != reflect.TypeOf("") {
 			t.Errorf("ScanType(%d) = %v, want string", i, got)
 		}
@@ -1944,6 +1949,12 @@ func TestUnmappedTypesStayText(t *testing.T) {
 	if name := types[0].DatabaseTypeName(); name != "" {
 		t.Errorf("DatabaseTypeName(array) = %q, want no name for an OID outside the table", name)
 	}
+	if name := types[6].DatabaseTypeName(); name != "raw" {
+		t.Errorf("DatabaseTypeName(raw) = %q", name)
+	}
+	if name := types[7].DatabaseTypeName(); name != "blob" {
+		t.Errorf("DatabaseTypeName(blob) = %q", name)
+	}
 
 	wantValues := []string{
 		"{1,2,NULL}",
@@ -1952,13 +1963,15 @@ func TestUnmappedTypesStayText(t *testing.T) {
 		`{"k": "v", "n": 1}`,
 		"happy",
 		"domain value",
+		"0a0b0c",
+		`\xdeadbeef`,
 	}
 
 	if !rows.Next() {
 		t.Fatalf("Next: %v", rows.Err())
 	}
-	var values [6]string
-	dest := []any{&values[0], &values[1], &values[2], &values[3], &values[4], &values[5]}
+	var values [8]string
+	dest := []any{&values[0], &values[1], &values[2], &values[3], &values[4], &values[5], &values[6], &values[7]}
 	if err := rows.Scan(dest...); err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
