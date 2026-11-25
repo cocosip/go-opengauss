@@ -39,6 +39,7 @@ const (
 	Numeric     int32 = 1700
 	UUID        int32 = 2950
 	JSONB       int32 = 3802
+	Nvarchar2   int32 = 3969
 )
 
 var typeNames = map[int32]string{
@@ -66,6 +67,7 @@ var typeNames = map[int32]string{
 	Numeric:     "numeric",
 	UUID:        "uuid",
 	JSONB:       "jsonb",
+	Nvarchar2:   "nvarchar2",
 }
 
 // TypeName returns the openGauss name of a type OID, or "" when it is unknown.
@@ -92,16 +94,21 @@ func ScanType(typeOID int32) reflect.Type {
 	}
 }
 
+// charSemanticBit marks a length declared in characters rather than bytes, as
+// in varchar(10 char). It is stored in the type modifier by openGauss.
+const charSemanticBit = int32(0x40000000)
+
 // ColumnLength returns the declared length of a character or bit column from
 // the type modifier in RowDescription. A character type stores VARHDRSZ plus
 // the length, while a bit type stores the bit count itself; a modifier that
 // carries no length means the column is unconstrained.
 func ColumnLength(typeOID, typeMod int32) (int64, bool) {
 	switch typeOID {
-	case Varchar, Bpchar:
+	case Varchar, Bpchar, Nvarchar2:
 		// Postgres keeps VARHDRSZ + characters for historical reasons.
 		if typeMod > 4 {
-			return int64(typeMod - 4), true
+			length := int64(typeMod-4) &^ int64(charSemanticBit)
+			return length, true
 		}
 	case Bit, Varbit:
 		// The modifier is the bit count itself, without VARHDRSZ.

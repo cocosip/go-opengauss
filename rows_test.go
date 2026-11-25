@@ -102,7 +102,7 @@ func TestRowsColumnMetadataBounds(t *testing.T) {
 // TestColumnTypesReportDeclaredModifiers checks the typmod-derived metadata:
 // declared lengths for character and bit types and precision/scale for numeric.
 func TestColumnTypesReportDeclaredModifiers(t *testing.T) {
-	const query = "SELECT v, c, b, b1, n, neg, t FROM typmods"
+	const query = "SELECT v, c, b, b1, n, neg, nv, t FROM typmods"
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)
 		if got := s.expectSimpleQuery(); got != query {
@@ -116,6 +116,7 @@ func TestColumnTypesReportDeclaredModifiers(t *testing.T) {
 			fakeColumn{name: "b1", oid: oid.Bit, typmod: 1},                                 // bit(1)
 			fakeColumn{name: "n", oid: oid.Numeric, typmod: 4 + (12<<16 | 4)},               // numeric(12,4)
 			fakeColumn{name: "neg", oid: oid.Numeric, typmod: 4 + (10<<16 | (-2 & 0xffff))}, // numeric(10,-2)
+			fakeColumn{name: "nv", oid: oid.Nvarchar2, typmod: 14},                          // nvarchar2(10)
 			fakeColumn{name: "t", oid: oid.Text},
 		)
 		s.sendCommandComplete("SELECT 0")
@@ -133,7 +134,7 @@ func TestColumnTypesReportDeclaredModifiers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ColumnTypes: %v", err)
 	}
-	if len(types) != 7 {
+	if len(types) != 8 {
 		t.Fatalf("ColumnTypes returned %d columns", len(types))
 	}
 	if name := types[0].DatabaseTypeName(); name != "varchar" {
@@ -163,10 +164,13 @@ func TestColumnTypesReportDeclaredModifiers(t *testing.T) {
 	if precision, scale, ok := types[5].DecimalSize(); !ok || precision != 10 || scale != -2 {
 		t.Errorf("numeric(10,-2) precision/scale = %d/%d, %v, want 10/-2", precision, scale, ok)
 	}
-	if _, ok := types[6].Length(); ok {
+	if length, ok := types[6].Length(); !ok || length != 10 {
+		t.Errorf("nvarchar2 length = %d, %v, want 10", length, ok)
+	}
+	if _, ok := types[7].Length(); ok {
 		t.Error("text reported a declared length")
 	}
-	if _, _, ok := types[6].DecimalSize(); ok {
+	if _, _, ok := types[7].DecimalSize(); ok {
 		t.Error("text reported a numeric precision")
 	}
 	// Nullability needs a catalog lookup, so it stays unknown rather than
