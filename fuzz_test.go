@@ -64,5 +64,25 @@ func FuzzCopyDirection(f *testing.F) {
 		if kind == copyNone && clauseEnd != 0 {
 			t.Fatalf("copyDirection(%q) = none with clause end %d", statement, clauseEnd)
 		}
+		if kind != copyNone {
+			_ = copyInTailError(statement, clauseEnd)
+			_ = copyOutTailError(statement, clauseEnd)
+		}
+	})
+}
+
+func FuzzValidateVectorQuery(f *testing.F) {
+	f.Add("SELECT id FROM t ORDER BY vec <-> $1 LIMIT 10")
+	f.Add("SELECT * FROM t WHERE vec <#> $1 > 0.5 ORDER BY vec <=> $1")
+	f.Add("select id from t")
+	f.Add("SELECT 'x <-> y' FROM t WHERE id = $1")
+	f.Add("/* <-> */ SELECT 1")
+	f.Add("-- <->\nSELECT 1")
+	f.Add("")
+	f.Fuzz(func(t *testing.T, query string) {
+		if statements, _ := inspectVectorQuery(query); statements < 0 {
+			t.Fatalf("inspectVectorQuery(%q) returned %d statements", query, statements)
+		}
+		_ = validateVectorQuery(query)
 	})
 }
