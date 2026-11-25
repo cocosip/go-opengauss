@@ -34,4 +34,16 @@
 //
 // ColumnTypes reports the database type name and the Go scan type that this
 // mapping produces for each column.
+//
+// # Session-scoped helpers
+//
+// NewListener keeps one dedicated session for LISTEN/NOTIFY and reconnects it
+// after a failure, re-registering the channels it had accepted. It is separate
+// from the sql.DB pool because a notification belongs to the session that
+// registered for it.
+//
+// ExecuteMultiSearch runs one vector query per argument set on sessions taken
+// from the caller's pool, applies scan parameters such as hnsw_ef_search to
+// each pinned session, restores them afterwards, preserves the input order and
+// reports a failure per argument set.
 package opengauss
