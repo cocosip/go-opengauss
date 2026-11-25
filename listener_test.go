@@ -417,3 +417,25 @@ func TestQuoteLiteralEscapesSingleQuotesAndBackslashes(t *testing.T) {
 		t.Fatalf("quoteLiteral = %s, want %s", got, want)
 	}
 }
+
+// TestListenerNextBackoffDoublesAndCaps checks the reconnect delay strategy:
+// the delay doubles after every failed attempt and stops at the configured
+// maximum instead of growing without bound.
+func TestListenerNextBackoffDoublesAndCaps(t *testing.T) {
+	l := &Listener{minReconnectInterval: 100 * time.Millisecond, maxReconnectInterval: time.Second}
+	tests := []struct {
+		current time.Duration
+		want    time.Duration
+	}{
+		{100 * time.Millisecond, 200 * time.Millisecond},
+		{400 * time.Millisecond, 800 * time.Millisecond},
+		{500 * time.Millisecond, time.Second},
+		{800 * time.Millisecond, time.Second},
+		{time.Second, time.Second},
+	}
+	for _, tc := range tests {
+		if got := l.nextBackoff(tc.current); got != tc.want {
+			t.Errorf("nextBackoff(%v) = %v, want %v", tc.current, got, tc.want)
+		}
+	}
+}
