@@ -19,6 +19,9 @@ func (c *conn) ExecContext(ctx context.Context, statement string, args []driver.
 	if err := validateQuery(statement); err != nil {
 		return nil, err
 	}
+	if isCopyFromStdin(statement) {
+		return nil, errCopyInRequired
+	}
 	frames, err := queryFrames(statement, args)
 	if err != nil {
 		return nil, err
@@ -34,6 +37,9 @@ func (c *conn) ExecContext(ctx context.Context, statement string, args []driver.
 func (c *conn) QueryContext(ctx context.Context, statement string, args []driver.NamedValue) (driver.Rows, error) {
 	if err := validateQuery(statement); err != nil {
 		return nil, err
+	}
+	if isCopyFromStdin(statement) {
+		return nil, errCopyInRequired
 	}
 	frames, err := queryFrames(statement, args)
 	if err != nil {
@@ -109,13 +115,14 @@ func (c *conn) Ping(ctx context.Context) error {
 	return rows.Close()
 }
 
-// ResetSession discards a connection that is still inside a transaction, so
-// the pool never hands out a session with stale transaction state.
+// ResetSession discards a connection that is still inside a transaction or in
+// the middle of a COPY stream, so the pool never hands out a session whose
+// protocol state belongs to an abandoned operation.
 func (c *conn) ResetSession(context.Context) error {
 	if c.bad {
 		return driver.ErrBadConn
 	}
-	if c.txnStatus != proto.TxnIdle {
+	if c.txnStatus != proto.TxnIdle || c.copying {
 		c.bad = true
 		return driver.ErrBadConn
 	}
@@ -126,6 +133,12 @@ func (c *conn) ResetSession(context.Context) error {
 func (c *conn) Close() error {
 	if c.netConn == nil {
 		return nil
+	}
+	if c.copyWatcher != nil {
+		// Stop an abandoned stream's watcher before the socket disappears.
+		c.endOperation(c.copyWatcher)
+		c.copyWatcher = nil
+		c.copying = false
 	}
 	if !c.bad {
 		_ = c.sendFrames(proto.NewMessageWriter(proto.MsgTerminate).Finish())
@@ -269,7 +282,7 @@ func (c *conn) readExecResult() (string, error) {
 			// Exec discards any result payload.
 		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
 			c.bad = true
-			return "", fmt.Errorf("opengauss: COPY is not implemented yet (message %q)", typ)
+			return "", copyStreamError(typ)
 		default:
 			c.bad = true
 			return "", fmt.Errorf("opengauss: unexpected message type %q while executing", typ)
@@ -310,7 +323,7 @@ func (c *conn) readQueryRows() (*rows, error) {
 			// Empty query and extended-protocol acknowledgements carry no rows.
 		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
 			c.bad = true
-			return nil, fmt.Errorf("opengauss: COPY is not implemented yet (message %q)", typ)
+			return nil, copyStreamError(typ)
 		default:
 			c.bad = true
 			return nil, fmt.Errorf("opengauss: unexpected message type %q while reading query result", typ)
@@ -337,7 +350,7 @@ func (c *conn) drainUntilReady() error {
 			// Discarded while resynchronizing.
 		case proto.MsgCopyInResponse, proto.MsgCopyOutResponse, proto.MsgCopyBothResponse:
 			c.bad = true
-			return fmt.Errorf("opengauss: COPY is not implemented yet (message %q)", typ)
+			return copyStreamError(typ)
 		default:
 			c.bad = true
 			return fmt.Errorf("opengauss: unexpected message type %q while resynchronizing", typ)

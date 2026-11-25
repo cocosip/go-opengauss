@@ -128,7 +128,7 @@ func (r *rows) Next(dest []driver.Value) error {
 			r.conn.bad = true
 			r.done = true
 			r.finish()
-			return fmt.Errorf("opengauss: COPY is not implemented yet (message %q)", typ)
+			return copyStreamError(typ)
 		default:
 			r.conn.bad = true
 			r.done = true

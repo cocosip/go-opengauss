@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/cocosip/go-opengauss/internal/proto"
@@ -16,7 +17,8 @@ import (
 // Call Exec once per row and then Close, which finishes the stream and reads
 // the server's result. A row is written in the text COPY format: values are
 // converted like other parameters, NULL becomes \N, and tabs, newlines,
-// carriage returns and backslashes are escaped.
+// carriage returns and backslashes are escaped. Options after FROM STDIN such
+// as CSV or HEADER are rejected: only the default text format is implemented.
 func CopyIn(tx *sql.Tx, table string, columns ...string) (*CopyInStatement, error) {
 	if tx == nil {
 		return nil, errors.New("opengauss: CopyIn needs a transaction")
@@ -92,6 +94,44 @@ func isCopyFromStdin(statement string) bool {
 	return strings.Contains(strings.ToUpper(trimmed), " FROM STDIN")
 }
 
+var errCopyInRequired = errors.New("opengauss: COPY ... FROM STDIN must be started through CopyIn(tx, ...)")
+
+// copyStreamError names the COPY direction a server answered with, so an
+// application that sent the statement through the wrong entry point sees which
+// part is unsupported.
+func copyStreamError(typ byte) error {
+	switch typ {
+	case proto.MsgCopyInResponse:
+		return errCopyInRequired
+	case proto.MsgCopyOutResponse:
+		return errors.New("opengauss: COPY ... TO STDOUT is not supported yet")
+	default:
+		return errors.New("opengauss: the COPY BOTH protocol is not supported")
+	}
+}
+
+// copyInTailError rejects COPY options, because the row encoder always writes
+// the default text format. A CSV or HEADER stream would be parsed under
+// different rules and silently import wrong values.
+func copyInTailError(statement string) error {
+	upper := strings.ToUpper(statement)
+	// The last occurrence is the clause: a quoted identifier may itself
+	// contain the words "FROM STDIN".
+	index := strings.LastIndex(upper, " FROM STDIN")
+	if index < 0 {
+		return nil
+	}
+	rest := statement[index+len(" FROM STDIN"):]
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case ' ', '\t', '\n', '\r', '\v', '\f', ';':
+		default:
+			return errors.New("opengauss: COPY ... FROM STDIN options are not implemented: the driver writes the default text format only")
+		}
+	}
+	return nil
+}
+
 // copyStmt is a COPY ... FROM STDIN statement. The server is not asked to
 // prepare it: each Exec call sends one CopyData row and the final one sends
 // CopyDone and reads the command result.
@@ -99,6 +139,7 @@ type copyStmt struct {
 	conn      *conn
 	statement string
 	closed    bool
+	finished  bool
 }
 
 // NumInput reports that the row width comes from the server, not from a
@@ -124,13 +165,18 @@ func (s *copyStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (d
 	if s.conn.bad {
 		return nil, driver.ErrBadConn
 	}
-	if !s.conn.copying {
-		if err := s.conn.beginCopyIn(ctx, s.statement); err != nil {
-			return nil, err
+	if s.finished {
+		return nil, errors.New("opengauss: the COPY ... FROM STDIN stream is already finished")
+	}
+	if s.conn.copying {
+		if s.conn.copyOwner != s {
+			return nil, errors.New("opengauss: another COPY stream is open on this session")
 		}
+	} else if err := s.conn.beginCopyIn(ctx, s); err != nil {
+		return nil, err
 	}
 	if len(args) > 0 {
-		if err := s.conn.writeCopyRow(args); err != nil {
+		if err := s.conn.writeCopyRow(ctx, args); err != nil {
 			return nil, err
 		}
 		return result{}, nil
@@ -142,13 +188,14 @@ func (s *copyStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (d
 	return result{tag: tag}, nil
 }
 
-// Close finishes an open stream so the session stays synchronized.
+// Close finishes an open stream so the session stays synchronized. A close
+// after a failed row does nothing: that error already ended the stream.
 func (s *copyStmt) Close() error {
 	if s.closed {
 		return nil
 	}
 	s.closed = true
-	if s.conn.bad || !s.conn.copying {
+	if s.conn.bad || !s.conn.copying || s.conn.copyOwner != s {
 		return nil
 	}
 	_, err := s.conn.finishCopyIn()
@@ -156,7 +203,7 @@ func (s *copyStmt) Close() error {
 }
 
 // beginCopyIn sends the COPY statement and waits for CopyInResponse.
-func (c *conn) beginCopyIn(ctx context.Context, statement string) error {
+func (c *conn) beginCopyIn(ctx context.Context, owner *copyStmt) error {
 	if c.copying {
 		return errors.New("opengauss: a COPY stream is already open")
 	}
@@ -165,7 +212,7 @@ func (c *conn) beginCopyIn(ctx context.Context, statement string) error {
 		return err
 	}
 	query := proto.NewMessageWriter(proto.MsgQuery)
-	query.String(statement)
+	query.String(owner.statement)
 	if err := c.sendFrames(query.Finish()); err != nil {
 		c.endOperation(watcher)
 		return c.wrapIOError(ctx, "copy", err)
@@ -191,6 +238,7 @@ func (c *conn) beginCopyIn(ctx context.Context, statement string) error {
 				return fmt.Errorf("opengauss: COPY uses binary format, which this driver does not request")
 			}
 			c.copying = true
+			c.copyOwner = owner
 			c.copyColumns = columns
 			c.copyWatcher = watcher
 			c.copyCtx = ctx
@@ -213,28 +261,86 @@ func (c *conn) beginCopyIn(ctx context.Context, statement string) error {
 	}
 }
 
-// writeCopyRow sends one text-format row.
-func (c *conn) writeCopyRow(args []driver.NamedValue) error {
+// writeCopyRow sends one text-format row. A row that cannot be encoded, has the
+// wrong width or belongs to an ended context ends the stream with CopyFail, so
+// the server aborts the COPY instead of importing the rows already sent.
+func (c *conn) writeCopyRow(ctx context.Context, args []driver.NamedValue) error {
 	if !c.copying {
 		return errors.New("opengauss: the COPY stream is not open")
 	}
-	if len(args) != c.copyColumns {
-		return fmt.Errorf("opengauss: COPY writes %d columns but the row has %d", c.copyColumns, len(args))
-	}
-	line, err := encodeCopyRow(nil, args)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
+		c.abortCopyIn(err)
 		return err
 	}
+	if len(args) != c.copyColumns {
+		err := fmt.Errorf("opengauss: COPY writes %d columns but the row has %d", c.copyColumns, len(args))
+		c.abortCopyIn(err)
+		return err
+	}
+	line, err := encodeCopyRow(c.copyRowBuf[:0], args)
+	if err != nil {
+		c.copyRowBuf = nil
+		c.abortCopyIn(err)
+		return err
+	}
+	if len(line) > math.MaxInt32 {
+		c.copyRowBuf = nil
+		err := fmt.Errorf("opengauss: a COPY row of %d bytes exceeds the protocol limit", len(line))
+		c.abortCopyIn(err)
+		return err
+	}
+	c.copyRowBuf = line[:0]
 	writer := proto.NewMessageWriter(proto.MsgCopyData)
 	writer.Bytes(line)
 	if err := c.sendFrames(writer.Finish()); err != nil {
-		// The stream can no longer be completed on this session.
+		// The stream can no longer be completed on this session: stop the
+		// watcher that belongs to the open stream before discarding the
+		// connection.
+		watcher := c.copyWatcher
+		streamCtx := c.copyCtx
+		if c.copyOwner != nil {
+			c.copyOwner.finished = true
+		}
 		c.copying = false
+		c.copyOwner = nil
 		c.copyWatcher = nil
+		c.copyCtx = nil
+		c.endOperation(watcher)
 		c.bad = true
-		return c.wrapIOError(c.copyCtx, "copy", err)
+		return c.wrapIOError(streamCtx, "copy", err)
 	}
 	return nil
+}
+
+// abortCopyIn asks the server to discard the stream and resynchronizes the
+// session, so the transaction may still roll back and the connection may be
+// reused. The original error is the caller's to report.
+func (c *conn) abortCopyIn(reason error) {
+	if !c.copying {
+		return
+	}
+	watcher := c.copyWatcher
+	c.copying = false
+	if c.copyOwner != nil {
+		c.copyOwner.finished = true
+		c.copyOwner = nil
+	}
+	c.copyWatcher = nil
+	c.copyCtx = nil
+
+	fail := proto.NewMessageWriter(proto.MsgCopyFail)
+	fail.String(reason.Error())
+	if err := c.sendFrames(fail.Finish()); err != nil {
+		c.bad = true
+		c.endOperation(watcher)
+		return
+	}
+	// The server answers CopyFail with an error and then ReadyForQuery. Both
+	// are discarded: the caller already has the reason the stream ended.
+	if err := c.drainUntilReady(); err != nil {
+		c.bad = true
+	}
+	c.endOperation(watcher)
 }
 
 // finishCopyIn sends CopyDone and reads the command tag. A server error sent
@@ -247,6 +353,11 @@ func (c *conn) finishCopyIn() (string, error) {
 	ctx := c.copyCtx
 	c.copying = false
 	c.copyWatcher = nil
+	c.copyCtx = nil
+	if c.copyOwner != nil {
+		c.copyOwner.finished = true
+		c.copyOwner = nil
+	}
 
 	if err := c.sendFrames(proto.NewMessageWriter(proto.MsgCopyDone).Finish()); err != nil {
 		c.bad = true
@@ -267,7 +378,11 @@ func (c *conn) finishCopyIn() (string, error) {
 		}
 		switch typ {
 		case proto.MsgCommandComplete:
-			tag = commandTag(body)
+			// The first tag belongs to the COPY itself; a trailing statement
+			// must not replace the reported row count.
+			if tag == "" {
+				tag = commandTag(body)
+			}
 		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
 			c.endOperation(watcher)
@@ -277,8 +392,11 @@ func (c *conn) finishCopyIn() (string, error) {
 			return tag, nil
 		case proto.MsgErrorResponse:
 			serverErr = parseErrorResponse(body)
-		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus:
-			// Asynchronous messages are not part of the COPY result.
+		case proto.MsgNoticeResponse, proto.MsgNotificationResponse, proto.MsgParameterStatus,
+			proto.MsgEmptyQueryResponse, proto.MsgRowDescription, proto.MsgDataRow, proto.MsgNoData,
+			proto.MsgParseComplete, proto.MsgBindComplete, proto.MsgParameterDescription, proto.MsgCloseComplete:
+			// Asynchronous messages and the payload of a trailing statement are
+			// not part of the COPY result.
 		default:
 			c.bad = true
 			c.endOperation(watcher)
@@ -287,7 +405,8 @@ func (c *conn) finishCopyIn() (string, error) {
 	}
 }
 
-// parseCopyInResponse reads the format and column count of CopyInResponse.
+// parseCopyInResponse reads the format and column count of CopyInResponse. The
+// driver only writes the default text format, so every column must be text.
 func parseCopyInResponse(body []byte) (format byte, columns int, err error) {
 	r := &proto.ReadBuf{B: body}
 	format = r.Byte()
@@ -296,7 +415,9 @@ func parseCopyInResponse(body []byte) (format byte, columns int, err error) {
 		return 0, 0, proto.ErrMalformedMessage
 	}
 	for i := 0; i < count; i++ {
-		r.Int16() // per-column format
+		if columnFormat := r.Int16(); columnFormat != 0 {
+			return 0, 0, fmt.Errorf("opengauss: COPY column %d uses binary format, which this driver does not request", i+1)
+		}
 	}
 	if r.Err != nil {
 		return 0, 0, proto.ErrMalformedMessage

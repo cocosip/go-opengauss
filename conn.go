@@ -86,10 +86,14 @@ type conn struct {
 	stmtCounter int
 
 	// An open COPY stream owns the session until CopyDone: copying records
-	// that state, copyColumns is the row width from CopyInResponse, and the
-	// watcher and context belong to the call that started the stream.
+	// that state, copyOwner is the statement that may extend the stream,
+	// copyColumns is the row width from CopyInResponse, copyRowBuf is reused
+	// for row encoding, and the watcher and context belong to the call that
+	// started the stream.
 	copying     bool
+	copyOwner   *copyStmt
 	copyColumns int
+	copyRowBuf  []byte
 	copyWatcher *cancelWatcher
 	copyCtx     context.Context
 

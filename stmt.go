@@ -29,10 +29,21 @@ func (c *conn) PrepareContext(ctx context.Context, statement string) (driver.Stm
 		return nil, err
 	}
 	// A COPY stream is not prepared on the server: it keeps the simple query
-	// protocol so rows can be appended without a Bind/Execute per row.
+	// protocol so rows can be appended without a Bind/Execute per row. It is
+	// only valid on a session pinned by a transaction, which database/sql
+	// guarantees for a statement prepared from a *sql.Tx.
 	if isCopyFromStdin(statement) {
 		if c.bad {
 			return nil, driver.ErrBadConn
+		}
+		if c.txnStatus != proto.TxnInTransaction {
+			return nil, errors.New("opengauss: COPY ... FROM STDIN must run inside a transaction: use CopyIn(tx, ...)")
+		}
+		if err := copyInTailError(statement); err != nil {
+			return nil, err
+		}
+		if c.copying {
+			return nil, errors.New("opengauss: a COPY stream is already open on this session")
 		}
 		return &copyStmt{conn: c, statement: statement}, nil
 	}
