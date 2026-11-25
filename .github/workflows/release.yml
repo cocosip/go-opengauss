@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        shell: bash
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          CURR_TAG=${GITHUB_REF#refs/tags/}
+          {
+            echo "## What's Changed"
+            echo
+            git log "${PREV_TAG}..HEAD" --pretty=tformat:"- %s" --no-merges
+            echo
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${CURR_TAG}"
+          } > CHANGELOG_BODY.md
+
+      - name: Classify release
+        id: classify
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          lower="${TAG,,}"
+          case "$lower" in
+            *-rc*|*-alpha*|*-beta*|*-pre*|*-dev*|*-snapshot*|*-nightly*)
+              echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: CHANGELOG_BODY.md
+          draft: false
+          prerelease: ${{ steps.classify.outputs.prerelease }}
+          make_latest: ${{ steps.classify.outputs.prerelease == 'false' && 'true' || 'false' }}

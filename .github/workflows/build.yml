@@ -1,0 +1,138 @@
+name: Build
+
+on:
+  push:
+    branches: [master, main, develop]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  # The CI toolchain is Go 1.27.x while go.mod declares go 1.26.0: the pinned
+  # golangci-lint v2.14.0 needs a 1.27.x toolchain, and the build environment
+  # may be newer than the language version the module targets.
+  GO_VERSION: '1.27.x'
+  GOTOOLCHAIN: local
+  CGO_ENABLED: '0'
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # The module has no external dependencies, so there is no module
+          # cache to save.
+          cache: false
+      - name: Download and verify dependencies
+        run: |
+          go mod download
+          go mod verify
+      - name: Unit tests
+        shell: bash
+        run: go test ${{ matrix.os == 'ubuntu-latest' && '-coverprofile=coverage.out -covermode=atomic' || '' }} ./... -count=1 -timeout 5m
+      - name: Build packages
+        if: matrix.os == 'ubuntu-latest'
+        run: go build ./...
+      - name: Upload coverage
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-linux
+          path: coverage.out
+          if-no-files-found: warn
+          retention-days: 14
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Check formatting and module files
+        shell: bash
+        run: |
+          files=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+          if [ -n "$files" ]; then
+            printf 'Run gofmt on:\n%s\n' "$files"
+            exit 1
+          fi
+          go mod tidy -diff
+      - name: Vet
+        run: go vet ./...
+      - name: Check GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          args: --timeout=10m
+
+  race:
+    name: Race
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The race detector links a C runtime; it only affects the test binary,
+    # while every shipped build stays CGO_ENABLED=0. Linux CI owns this check
+    # because the detector cannot run in this Windows development environment.
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Race detector
+        run: go test -race ./... -count=1 -timeout 10m
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: windows, goarch: amd64}
+          - {goos: darwin, goarch: amd64}
+          - {goos: darwin, goarch: arm64}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Cross-build with CGO disabled
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
+
+  release:
+    name: Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [test, lint]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
