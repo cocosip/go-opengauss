@@ -383,3 +383,57 @@ func TestLiveEncodings(t *testing.T) {
 		t.Errorf("NULL = %v, want nil", gotNull)
 	}
 }
+
+// TestLiveMultipleResultSets verifies a simple query batch on a live server: the
+// first row-producing statement yields the rows, statements without rows are
+// skipped and NextResultSet advances to the next set.
+func TestLiveMultipleResultSets(t *testing.T) {
+	dsn := os.Getenv("OPENGAUSS_DSN")
+	if dsn == "" {
+		t.Skip("set OPENGAUSS_DSN to run against a live openGauss server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	defer func() { _ = db.Close() }()
+
+	rows, err := db.QueryContext(ctx, "SET application_name = 'multi-result'; SELECT 1; SELECT 'two'")
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		t.Fatalf("first set: %v", rows.Err())
+	}
+	var first int64
+	if err := rows.Scan(&first); err != nil || first != 1 {
+		t.Fatalf("first value = %d, err = %v", first, err)
+	}
+	if rows.Next() {
+		t.Fatal("the first set returned an extra row")
+	}
+	if !rows.NextResultSet() {
+		t.Fatalf("NextResultSet to the second set = false, err = %v", rows.Err())
+	}
+	if !rows.Next() {
+		t.Fatalf("second set: %v", rows.Err())
+	}
+	var second string
+	if err := rows.Scan(&second); err != nil || second != "two" {
+		t.Fatalf("second value = %q, err = %v", second, err)
+	}
+	if rows.Next() {
+		t.Fatal("the second set returned an extra row")
+	}
+	if rows.NextResultSet() {
+		t.Fatal("a third set was reported")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows error: %v", err)
+	}
+}

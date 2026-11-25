@@ -323,13 +323,10 @@ func (c *conn) readQueryRows() (*rows, error) {
 			}
 			return &rows{conn: c, columns: columns}, nil
 		case proto.MsgCommandComplete:
-			if err := c.drainUntilReady(); err != nil {
-				return nil, err
-			}
-			if c.encodingErr != nil {
-				return nil, c.encodingErr
-			}
-			return &rows{conn: c, done: true}, nil
+			// A statement that produces no rows (SET, INSERT without
+			// RETURNING) ends here; a later statement in the same simple query
+			// may still produce the result set.
+			continue
 		case proto.MsgReadyForQuery:
 			c.setTxnStatus(body)
 			return &rows{conn: c, done: true}, nil

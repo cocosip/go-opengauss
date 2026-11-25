@@ -40,6 +40,18 @@
 // ColumnTypes reports the database type name and the Go scan type that this
 // mapping produces for each column.
 //
+// # Multiple statements
+//
+// A statement executed directly on the connection without parameters is sent
+// with the simple query protocol, which the server may run as several
+// statements separated by semicolons. The query returns the rows of the first
+// statement that produces them; Rows.NextResultSet advances to the following
+// sets even when the current one has unread rows, and statements without rows
+// such as SET or an INSERT without RETURNING are skipped. Always Close the
+// rows: before the last set it drains the remaining sets, so the session stays
+// reusable. Prepared statements always use the extended protocol, which carries
+// exactly one statement.
+//
 // # Session-scoped helpers
 //
 // CopyIn streams rows into a table inside a transaction with COPY ... FROM

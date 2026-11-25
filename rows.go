@@ -3,6 +3,7 @@ package opengauss
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -24,6 +25,12 @@ type rows struct {
 	ctx     context.Context
 	watcher *cancelWatcher
 	done    bool
+	// hasNext records a RowDescription read ahead after the current result set
+	// ended, so database/sql can advance with NextResultSet instead of closing
+	// the rows. nextColumns belongs to that pending set; columns stays the
+	// current set's metadata until NextResultSet commits the change.
+	hasNext     bool
+	nextColumns []column
 }
 
 func (r *rows) Columns() []string {
@@ -67,6 +74,8 @@ func (r *rows) Close() error {
 		return nil
 	}
 	r.done = true
+	r.hasNext = false
+	r.nextColumns = nil
 	err := r.conn.drainUntilReady()
 	r.finish()
 	if err != nil {
@@ -81,8 +90,39 @@ func (r *rows) Close() error {
 	return r.conn.encodingErr
 }
 
-func (r *rows) Next(dest []driver.Value) error {
+// HasNextResultSet implements driver.RowsNextResultSet. A simple query executed
+// directly on a connection can carry several statements, and each statement
+// that produces rows is one result set.
+func (r *rows) HasNextResultSet() bool {
+	return r.hasNext
+}
+
+// NextResultSet implements driver.RowsNextResultSet. The contract requires
+// advancing even when the current set still has unread rows, so those rows are
+// discarded first.
+func (r *rows) NextResultSet() error {
 	if r.done {
+		return io.EOF
+	}
+	dest := make([]driver.Value, len(r.columns))
+	for !r.hasNext && !r.done {
+		if err := r.Next(dest); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+	}
+	if r.done || !r.hasNext {
+		return io.EOF
+	}
+	r.columns = r.nextColumns
+	r.nextColumns = nil
+	r.hasNext = false
+	return nil
+}
+
+func (r *rows) Next(dest []driver.Value) error {
+	if r.done || r.hasNext {
+		// The next result set must be started with NextResultSet; until then
+		// the current set stays finished.
 		return io.EOF
 	}
 	for {
@@ -104,9 +144,26 @@ func (r *rows) Next(dest []driver.Value) error {
 				return err
 			}
 			return nil
+		case proto.MsgRowDescription:
+			// The current set ended with its CommandComplete, so this
+			// description belongs to the next statement's result set. It is
+			// kept apart until NextResultSet makes it current.
+			columns, err := parseRowDescription(body)
+			if err != nil {
+				r.conn.bad = true
+				r.done = true
+				r.finish()
+				return err
+			}
+			r.nextColumns = columns
+			r.hasNext = true
+			return io.EOF
+		case proto.MsgEmptyQueryResponse:
+			// An empty statement in a simple-target batch produces no rows and
+			// no tag; the batch continues with the next statement.
 		case proto.MsgCommandComplete:
-			// The command tag is only needed by Exec; keep reading until the
-			// server marks the session ready.
+			// The current statement is done; keep reading until another result
+			// set or ReadyForQuery.
 		case proto.MsgReadyForQuery:
 			r.conn.setTxnStatus(body)
 			r.done = true
