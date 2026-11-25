@@ -1055,6 +1055,258 @@ func TestCancelWithoutServerAcknowledgementDiscardsSession(t *testing.T) {
 		t.Errorf("connections = %d, want 2: the unacknowledged session must be discarded", got)
 	}
 }
+
+// connectTargets dials the target list with the given extra parameters and
+// returns the physical connection, which names the endpoint that won.
+func connectTargets(t *testing.T, targets string, extras string) (*conn, error) {
+	t.Helper()
+	dsn := fmt.Sprintf("%s user=%s password=%s dbname=%s sslmode=disable", targets, testUser, testPassword, testDatabase)
+	if extras != "" {
+		dsn += " " + extras
+	}
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	physical, err := connector.Connect(testContext(t))
+	if err != nil {
+		return nil, err
+	}
+	c, ok := physical.(*conn)
+	if !ok {
+		t.Fatalf("Connect returned %T, want *conn", physical)
+	}
+	return c, nil
+}
+
+func TestTargetSessionAttrsSelectsStandby(t *testing.T) {
+	primary := newRoleServer(t, false, false)
+	standby := newRoleServer(t, true, true)
+
+	targets := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d", primary.port(), standby.port())
+	c, err := connectTargets(t, targets, "target_session_attrs=standby")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if c.target.Port != standby.port() {
+		t.Errorf("connected to %s, want the standby %d", c.target, standby.port())
+	}
+	if primary.connections() != 1 || standby.connections() != 1 {
+		t.Errorf("connections = %d/%d, want both targets probed", primary.connections(), standby.connections())
+	}
+}
+
+func TestTargetSessionAttrsEnforcesReadWriteAndReadOnly(t *testing.T) {
+	// The first target is a standby, so read-write must skip it.
+	standbyFirst := newRoleServer(t, true, true)
+	primarySecond := newRoleServer(t, false, false)
+	readWriteTargets := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d", standbyFirst.port(), primarySecond.port())
+
+	readWrite, err := connectTargets(t, readWriteTargets, "target_session_attrs=read-write")
+	if err != nil {
+		t.Fatalf("read-write: %v", err)
+	}
+	defer func() { _ = readWrite.Close() }()
+	if readWrite.target.Port != primarySecond.port() {
+		t.Errorf("read-write connected to %s, want the primary", readWrite.target)
+	}
+	if standbyFirst.connections() != 1 || primarySecond.connections() != 1 {
+		t.Errorf("connections = %d/%d, want both targets probed", standbyFirst.connections(), primarySecond.connections())
+	}
+
+	primaryFirst := newRoleServer(t, false, false)
+	standbySecond := newRoleServer(t, true, true)
+	readOnlyTargets := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d", primaryFirst.port(), standbySecond.port())
+
+	readOnly, err := connectTargets(t, readOnlyTargets, "target_session_attrs=read-only")
+	if err != nil {
+		t.Fatalf("read-only: %v", err)
+	}
+	defer func() { _ = readOnly.Close() }()
+	if readOnly.target.Port != standbySecond.port() {
+		t.Errorf("read-only connected to %s, want the standby", readOnly.target)
+	}
+}
+
+func TestTargetSessionAttrsReportsNoMatchingTarget(t *testing.T) {
+	first := newRoleServer(t, false, false)
+	second := newRoleServer(t, false, false)
+	targets := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d", first.port(), second.port())
+
+	_, err := connectTargets(t, targets, "target_session_attrs=standby")
+	if err == nil {
+		t.Fatal("expected the primary-only list to be rejected")
+	}
+	if !strings.Contains(err.Error(), "target_session_attrs=standby") ||
+		!strings.Contains(err.Error(), "primary read-write") {
+		t.Errorf("error = %v, want the rejected role", err)
+	}
+	if first.connections() != 1 || second.connections() != 1 {
+		t.Errorf("connections = %d/%d, want every target tried", first.connections(), second.connections())
+	}
+}
+
+func TestTargetSessionAttrsPreferStandbyFallsBackToPrimary(t *testing.T) {
+	first := newRoleServer(t, false, false)
+	second := newRoleServer(t, false, false)
+	targets := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d", first.port(), second.port())
+
+	c, err := connectTargets(t, targets, "target_session_attrs=prefer-standby")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if c.target.Port != first.port() {
+		t.Errorf("connected to %s, want the first acceptable primary", c.target)
+	}
+	if first.connections() != 1 {
+		t.Errorf("first target accepted %d connections, want the fallback reused", first.connections())
+	}
+	if second.connections() != 1 {
+		t.Errorf("second target accepted %d connections, want it probed too", second.connections())
+	}
+}
+
+func TestTargetSessionAttrsAnySkipsProbe(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		// Hold the session open without answering anything. A role probe would
+		// get no reply; connecting must not send one.
+		time.Sleep(300 * time.Millisecond)
+	})
+
+	targets := fmt.Sprintf("host=127.0.0.1 port=%d", server.port())
+	start := time.Now()
+	c, err := connectTargets(t, targets, "connect_timeout=1 target_session_attrs=any")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("Connect took %v, want no role probe with target_session_attrs=any", elapsed)
+	}
+}
+
+func TestSessionStateRejectsUnexpectedValue(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendRowDescription(
+			fakeColumn{name: "pg_is_in_recovery", oid: 16},
+			fakeColumn{name: "current_setting", oid: 25},
+		)
+		s.sendDataRow("maybe", "on")
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+	})
+
+	targets := fmt.Sprintf("host=127.0.0.1 port=%d", server.port())
+	_, err := connectTargets(t, targets, "target_session_attrs=standby")
+	if err == nil {
+		t.Fatal("expected an unreadable role to be rejected")
+	}
+	if !strings.Contains(err.Error(), "pg_is_in_recovery") {
+		t.Errorf("error = %v, want the failing column", err)
+	}
+}
+
+func TestTargetSessionAttrsSelectsPrimary(t *testing.T) {
+	standbyFirst := newRoleServer(t, true, true)
+	primarySecond := newRoleServer(t, false, false)
+	targets := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d", standbyFirst.port(), primarySecond.port())
+
+	c, err := connectTargets(t, targets, "target_session_attrs=primary")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if c.target.Port != primarySecond.port() {
+		t.Errorf("connected to %s, want the primary", c.target)
+	}
+}
+
+func TestTargetSessionAttrsReadWriteRejectsReadOnlyPrimary(t *testing.T) {
+	// A primary can still refuse writes through default_transaction_read_only,
+	// which read-write must reject and read-only must accept.
+	readOnlyPrimary := newRoleServer(t, false, true)
+	targets := fmt.Sprintf("host=127.0.0.1 port=%d", readOnlyPrimary.port())
+
+	if _, err := connectTargets(t, targets, "target_session_attrs=read-write"); err == nil {
+		t.Fatal("read-write accepted a read-only primary")
+	}
+	c, err := connectTargets(t, targets, "target_session_attrs=read-only")
+	if err != nil {
+		t.Fatalf("read-only: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+}
+
+func TestTargetSessionAttrsAcceptsOneAndZeroBooleans(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if query := s.expectSimpleQuery(); query != sessionStateQuery {
+			s.fail("state query = %q", query)
+			return
+		}
+		s.sendRowDescription(
+			fakeColumn{name: "pg_is_in_recovery", oid: 16},
+			fakeColumn{name: "current_setting", oid: 25},
+		)
+		// B-mode servers print 1/0 instead of t/f and on/off.
+		s.sendDataRow("1", "0")
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+	})
+
+	targets := fmt.Sprintf("host=127.0.0.1 port=%d", server.port())
+	standby, err := connectTargets(t, targets, "target_session_attrs=standby")
+	if err != nil {
+		t.Fatalf("standby: %v", err)
+	}
+	defer func() { _ = standby.Close() }()
+
+	// The read-only fact arrives as text, so 1 must also be understood there.
+	textOne := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendRowDescription(
+			fakeColumn{name: "pg_is_in_recovery", oid: 16},
+			fakeColumn{name: "current_setting", oid: 25},
+		)
+		s.sendDataRow("0", "1")
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+	})
+	readOnly, err := connectTargets(t, fmt.Sprintf("host=127.0.0.1 port=%d", textOne.port()), "target_session_attrs=read-only")
+	if err != nil {
+		t.Fatalf("read-only with 1: %v", err)
+	}
+	defer func() { _ = readOnly.Close() }()
+}
+
+func TestTargetSessionAttrsPreferStandbyReportsCredentialRejection(t *testing.T) {
+	primary := newRoleServer(t, false, false)
+	rejecting := newFakeServer(t, func(s *fakeSession) {
+		s.readStartup()
+		// An unsupported method fails authentication before any probe.
+		m := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+		m.Int32(auth.RequestGSS)
+		s.writeRaw(m.Finish())
+	})
+	targets := fmt.Sprintf("host=127.0.0.1,127.0.0.1 port=%d,%d", primary.port(), rejecting.port())
+
+	_, err := connectTargets(t, targets, "target_session_attrs=prefer-standby")
+	if err == nil {
+		t.Fatal("expected the rejected credentials to fail the connection")
+	}
+	if !strings.Contains(err.Error(), "authentication") {
+		t.Errorf("error = %v, want an authentication failure", err)
+	}
+}
+
 func TestCommitReportsServerRollback(t *testing.T) {
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)

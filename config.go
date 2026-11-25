@@ -44,6 +44,28 @@ func (t Target) String() string {
 	return net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
 }
 
+// TargetSessionAttrs selects which servers a connection attempt may use when a
+// host list names several endpoints.
+type TargetSessionAttrs string
+
+const (
+	TargetSessionAttrsAny           TargetSessionAttrs = "any"
+	TargetSessionAttrsReadWrite     TargetSessionAttrs = "read-write"
+	TargetSessionAttrsReadOnly      TargetSessionAttrs = "read-only"
+	TargetSessionAttrsPrimary       TargetSessionAttrs = "primary"
+	TargetSessionAttrsStandby       TargetSessionAttrs = "standby"
+	TargetSessionAttrsPreferStandby TargetSessionAttrs = "prefer-standby"
+)
+
+func (a TargetSessionAttrs) valid() bool {
+	switch a {
+	case TargetSessionAttrsAny, TargetSessionAttrsReadWrite, TargetSessionAttrsReadOnly,
+		TargetSessionAttrsPrimary, TargetSessionAttrsStandby, TargetSessionAttrsPreferStandby:
+		return true
+	}
+	return false
+}
+
 // Config is the immutable set of connection settings parsed from a DSN.
 // A Connector shares one Config between every physical connection it opens.
 type Config struct {
@@ -60,6 +82,10 @@ type Config struct {
 	SSLClientCert  string
 	SSLClientKey   string
 	ConnectTimeout time.Duration
+
+	// TargetSessionAttrs restricts which server roles a connection may use. The
+	// zero value means "any", which skips the role probe entirely.
+	TargetSessionAttrs TargetSessionAttrs
 
 	// passfile and passfileExplicit remember where a missing password may be
 	// resolved, so each target can be matched against its own entry.
@@ -171,6 +197,7 @@ var environmentParameters = []struct{ env, param string }{
 	{"PGSSLCERT", "sslcert"},
 	{"PGSSLKEY", "sslkey"},
 	{"PGCONNECT_TIMEOUT", "connect_timeout"},
+	{"PGTARGETSESSIONATTRS", "target_session_attrs"},
 }
 
 // applyEnvironment fills parameters that neither the DSN nor the service file
@@ -446,6 +473,12 @@ func newConfig(values map[string]string) (*Config, error) {
 				return nil, fmt.Errorf("opengauss: unsupported sslmode %q: use disable, allow, prefer, require, verify-ca or verify-full", value)
 			}
 			cfg.SSLMode = mode
+		case "target_session_attrs":
+			attrs := TargetSessionAttrs(value)
+			if !attrs.valid() {
+				return nil, fmt.Errorf("opengauss: unsupported target_session_attrs %q: use any, read-write, read-only, primary, standby or prefer-standby", value)
+			}
+			cfg.TargetSessionAttrs = attrs
 		case "sslrootcert":
 			cfg.SSLRootCert = value
 		case "sslcert":

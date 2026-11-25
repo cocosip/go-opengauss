@@ -275,6 +275,54 @@ func TestParseConfigURLUserinfoEscapes(t *testing.T) {
 	}
 }
 
+func TestParseConfigTargetSessionAttrs(t *testing.T) {
+	clearPGEnvironment(t)
+	tests := []struct {
+		dsn  string
+		want TargetSessionAttrs
+	}{
+		{"host=db user=alice target_session_attrs=read-write", TargetSessionAttrsReadWrite},
+		{"host=db user=alice target_session_attrs=read-only", TargetSessionAttrsReadOnly},
+		{"host=db user=alice target_session_attrs=primary", TargetSessionAttrsPrimary},
+		{"host=db user=alice target_session_attrs=standby", TargetSessionAttrsStandby},
+		{"host=db user=alice target_session_attrs=prefer-standby", TargetSessionAttrsPreferStandby},
+		{"host=db user=alice target_session_attrs=any", TargetSessionAttrsAny},
+		{"host=db user=alice", ""},
+		{"postgres://alice@db/app?target_session_attrs=standby", TargetSessionAttrsStandby},
+	}
+	for _, tc := range tests {
+		cfg, err := parseConfig(tc.dsn)
+		if err != nil {
+			t.Errorf("parseConfig(%q): %v", tc.dsn, err)
+			continue
+		}
+		if cfg.TargetSessionAttrs != tc.want {
+			t.Errorf("parseConfig(%q) TargetSessionAttrs = %q, want %q", tc.dsn, cfg.TargetSessionAttrs, tc.want)
+		}
+	}
+}
+
+func TestTargetSessionAttrsPrecedence(t *testing.T) {
+	clearPGEnvironment(t)
+	t.Setenv("PGTARGETSESSIONATTRS", "standby")
+
+	cfg, err := parseConfig("host=db user=alice")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.TargetSessionAttrs != TargetSessionAttrsStandby {
+		t.Errorf("TargetSessionAttrs = %q, want the environment value", cfg.TargetSessionAttrs)
+	}
+
+	cfg, err = parseConfig("host=db user=alice target_session_attrs=any")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.TargetSessionAttrs != TargetSessionAttrsAny {
+		t.Errorf("TargetSessionAttrs = %q, want the DSN value", cfg.TargetSessionAttrs)
+	}
+}
+
 func TestParseConfigRejects(t *testing.T) {
 	clearPGEnvironment(t)
 	tests := []struct {
@@ -289,7 +337,8 @@ func TestParseConfigRejects(t *testing.T) {
 		{"port too large", "user=alice port=65536", "port"},
 		{"negative port", "user=alice port=-1", "port"},
 		{"bad sslmode", "user=alice sslmode=bogus", "sslmode"},
-		{"unsupported option", "user=alice target_session_attrs=read-write", "target_session_attrs"},
+		{"unsupported option", "user=alice application_name=myapp", "application_name"},
+		{"bad target_session_attrs", "user=alice target_session_attrs=leader", "target_session_attrs"},
 		{"bad connect_timeout", "user=alice connect_timeout=soon", "connect_timeout"},
 		{"negative connect_timeout", "user=alice connect_timeout=-3", "connect_timeout"},
 		{"unknown scheme", "mysql://alice@localhost/db", "scheme"},

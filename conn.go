@@ -23,6 +23,7 @@ const (
 	stageTLS            = "tls"
 	stageStartup        = "startup"
 	stageAuthentication = "authentication"
+	stageSessionState   = "target_session_attrs"
 )
 
 // errSSLNotSupported reports that the server answered the SSLRequest with "N".
@@ -94,38 +95,89 @@ type conn struct {
 // the TLS fallback rules of the configured policy may retry within a target.
 func connect(ctx context.Context, cfg *Config) (*conn, error) {
 	errs := make([]error, 0, len(cfg.Targets))
+	var fallback *conn
 	for _, target := range cfg.Targets {
-		c, err := connectTarget(ctx, cfg, target)
-		if err == nil {
+		c, state, err := connectTarget(ctx, cfg, target)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("opengauss: connect to %s: %w", target, err))
+			// libpq stops at an authentication failure: the credentials were
+			// rejected, so they are not replayed against the remaining
+			// targets. The check covers the second attempt of an allow/prefer
+			// fallback, where the joined failure is not the first error.
+			if failureHasStage(err, stageAuthentication) {
+				// Even a prefer-standby fallback must not hide a rejected
+				// password: the credentials are wrong for every target.
+				if fallback != nil {
+					_ = fallback.Close()
+					fallback = nil
+				}
+				break
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+
+		if cfg.TargetSessionAttrs == "" || cfg.TargetSessionAttrs == TargetSessionAttrsAny {
 			return c, nil
 		}
-		errs = append(errs, fmt.Errorf("opengauss: connect to %s: %w", target, err))
-		// libpq stops at an authentication failure: the credentials were
-		// rejected, so they are not replayed against the remaining targets.
-		// The check covers the second attempt of an allow/prefer fallback,
-		// where the joined failure is not the first error of the join.
-		if failureHasStage(err, stageAuthentication) {
-			break
+		if cfg.TargetSessionAttrs.satisfiedBy(state) {
+			if fallback != nil {
+				_ = fallback.Close()
+			}
+			return c, nil
 		}
-		if ctx.Err() != nil {
-			break
+		errs = append(errs, fmt.Errorf("opengauss: connect to %s: target_session_attrs=%s rejected a %s server",
+			target, cfg.TargetSessionAttrs, state))
+		if cfg.TargetSessionAttrs == TargetSessionAttrsPreferStandby {
+			// Keep the first acceptable server in case no standby exists.
+			if fallback == nil {
+				fallback = c
+			} else {
+				_ = c.Close()
+			}
+			continue
 		}
+		_ = c.Close()
+	}
+	if fallback != nil {
+		return fallback, nil
 	}
 	return nil, fmt.Errorf("opengauss: no target accepted a connection: %w", errors.Join(errs...))
 }
 
-// connectTarget applies the TLS fallback policy of one endpoint. The
-// connect_timeout covers every attempt against that endpoint.
-func connectTarget(ctx context.Context, cfg *Config, target Target) (*conn, error) {
+// connectTarget opens one endpoint under the TLS fallback policy and reports the
+// server's session state when target_session_attrs asks for it. The
+// connect_timeout covers every attempt against that endpoint, including the
+// state probe.
+func connectTarget(ctx context.Context, cfg *Config, target Target) (*conn, sessionState, error) {
 	password, err := cfg.passwordForTarget(target)
 	if err != nil {
-		return nil, err
+		return nil, sessionState{}, err
 	}
 	if cfg.ConnectTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
 		defer cancel()
 	}
+	c, err := connectForPolicy(ctx, cfg, target, password)
+	if err != nil {
+		return nil, sessionState{}, err
+	}
+	if cfg.TargetSessionAttrs == "" || cfg.TargetSessionAttrs == TargetSessionAttrsAny {
+		return c, sessionState{}, nil
+	}
+	state, err := c.detectSessionState(ctx)
+	if err != nil {
+		_ = c.Close()
+		return nil, sessionState{}, &stageError{stageSessionState, err}
+	}
+	return c, state, nil
+}
+
+// connectForPolicy applies the TLS fallback rules of one endpoint.
+func connectForPolicy(ctx context.Context, cfg *Config, target Target, password string) (*conn, error) {
 	switch cfg.SSLMode {
 	case SSLModeDisable:
 		return connectOnce(ctx, cfg, target, password, false)

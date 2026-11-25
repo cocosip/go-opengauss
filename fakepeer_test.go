@@ -568,3 +568,37 @@ func (s *fakeSession) sendSlow(frame []byte) {
 		s.writeRaw([]byte{b})
 	}
 }
+
+// newRoleServer answers the target_session_attrs probe with the given role and
+// then closes the session, so tests assert which endpoint the driver picked.
+func newRoleServer(t *testing.T, inRecovery, readOnly bool) *fakeServer {
+	t.Helper()
+	return newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if query := s.expectSimpleQuery(); query != sessionStateQuery {
+			s.fail("state query = %q, want %q", query, sessionStateQuery)
+			return
+		}
+		s.sendRowDescription(
+			fakeColumn{name: "pg_is_in_recovery", oid: 16},
+			fakeColumn{name: "current_setting", oid: 25},
+		)
+		s.sendDataRow(serverBool(inRecovery), readOnlyText(readOnly))
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+	})
+}
+
+func serverBool(value bool) string {
+	if value {
+		return "t"
+	}
+	return "f"
+}
+
+func readOnlyText(readOnly bool) string {
+	if readOnly {
+		return "on"
+	}
+	return "off"
+}

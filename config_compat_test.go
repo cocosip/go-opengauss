@@ -15,7 +15,7 @@ func clearPGEnvironment(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
 		"PGHOST", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD", "PGSSLMODE",
-		"PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGCONNECT_TIMEOUT",
+		"PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGCONNECT_TIMEOUT", "PGTARGETSESSIONATTRS",
 		"PGSERVICE", "PGSERVICEFILE", "PGPASSFILE",
 	} {
 		t.Setenv(name, "")
