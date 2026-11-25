@@ -940,7 +940,39 @@ func TestConnectorRejectsUnreadableRootCert(t *testing.T) {
 	}
 }
 
+func TestPassfilePasswordAuthenticates(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		if query := s.expectSimpleQuery(); query != "" {
+			s.fail("ping query = %q", query)
+		}
+		s.sendEmptyQueryResponse()
+		s.sendReady(txnIdle)
+	})
+
+	passfile := writeConfigFile(t, "pgpass", fmt.Sprintf("127.0.0.1:%d:%s:%s:%s\n",
+		server.port(), testDatabase, testUser, testPassword))
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=%s dbname=%s sslmode=disable passfile=%s",
+		server.port(), testUser, testDatabase, filepath.ToSlash(passfile))
+
+	db := openTestDB(t, dsn)
+	if err := db.PingContext(testContext(t)); err != nil {
+		t.Fatalf("PingContext with a passfile password: %v", err)
+	}
+}
+
 func newTestCertificate(t *testing.T, dnsNames []string, ips []net.IP) (tls.Certificate, []byte) {
+	t.Helper()
+	certPEM, keyPEM := newTestCertificatePEM(t, dnsNames, ips)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("X509KeyPair: %v", err)
+	}
+	return cert, certPEM
+}
+
+func newTestCertificatePEM(t *testing.T, dnsNames []string, ips []net.IP) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -962,17 +994,12 @@ func newTestCertificate(t *testing.T, dnsNames []string, ips []net.IP) (tls.Cert
 	if err != nil {
 		t.Fatalf("create certificate: %v", err)
 	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatalf("marshal key: %v", err)
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		t.Fatalf("X509KeyPair: %v", err)
-	}
-	return cert, certPEM
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 }
 
 func writeRootCert(t *testing.T, certPEM []byte) string {

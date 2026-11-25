@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,8 @@ type Config struct {
 	Database       string
 	SSLMode        SSLMode
 	SSLRootCert    string
+	SSLClientCert  string
+	SSLClientKey   string
 	ConnectTimeout time.Duration
 
 	// tlsConfig is prepared once by NewConnector, so certificate files are
@@ -58,28 +61,94 @@ func (c *Config) String() string {
 
 const defaultPort = 5432
 
-// parseConfig turns a keyword/value DSN or a single-host URL into a Config.
+// parseConfig resolves a keyword/value DSN, a URL, the process environment and
+// an optional service file and passfile. Precedence follows libpq: explicit
+// DSN parameters win over service-file entries, which win over environment
+// variables; the passfile only supplies a password that nothing else set.
 // Settings the driver does not implement are rejected rather than ignored, so
 // an application never silently connects with a weaker policy than it asked
 // for.
 func parseConfig(dsn string) (*Config, error) {
-	if strings.TrimSpace(dsn) == "" {
-		return nil, errors.New("opengauss: empty DSN: supply a keyword/value DSN or a postgres:// URL; environment, service-file and passfile lookup are not implemented")
-	}
-
-	var (
-		values map[string]string
-		err    error
-	)
-	if schemeEnd := strings.Index(dsn, "://"); schemeEnd > 0 && isScheme(dsn[:schemeEnd]) {
-		values, err = parseURLDSN(dsn)
-	} else {
-		values, err = parseKeywordDSN(dsn)
-	}
+	values, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	return newConfig(values)
+
+	service, serviceSet := values["service"], values["service"] != ""
+	if !serviceSet {
+		service = os.Getenv("PGSERVICE")
+	}
+	delete(values, "service")
+	if service != "" {
+		if err := applyServiceFile(values, service); err != nil {
+			return nil, err
+		}
+	}
+
+	passfile, passfileSet := values["passfile"], values["passfile"] != ""
+	if !passfileSet {
+		passfile = os.Getenv("PGPASSFILE")
+	}
+	delete(values, "passfile")
+	applyEnvironment(values)
+
+	cfg, err := newConfig(values)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Password == "" {
+		password, err := lookupPassfile(passfile, passfileSet && passfile != "", cfg)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Password = password
+	}
+	return cfg, nil
+}
+
+// parseDSN parses only the DSN text. An empty DSN yields no parameters, which
+// lets the environment and service file supply everything.
+func parseDSN(dsn string) (map[string]string, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return map[string]string{}, nil
+	}
+	if schemeEnd := strings.Index(dsn, "://"); schemeEnd > 0 && isScheme(dsn[:schemeEnd]) {
+		return parseURLDSN(dsn)
+	}
+	return parseKeywordDSN(dsn)
+}
+
+// environmentParameters maps libpq environment variables to DSN parameters.
+var environmentParameters = []struct{ env, param string }{
+	{"PGHOST", "host"},
+	{"PGPORT", "port"},
+	{"PGDATABASE", "dbname"},
+	{"PGUSER", "user"},
+	{"PGPASSWORD", "password"},
+	{"PGSSLMODE", "sslmode"},
+	{"PGSSLROOTCERT", "sslrootcert"},
+	{"PGSSLCERT", "sslcert"},
+	{"PGSSLKEY", "sslkey"},
+	{"PGCONNECT_TIMEOUT", "connect_timeout"},
+}
+
+// applyEnvironment fills parameters that neither the DSN nor the service file
+// set. PGDATABASE is the environment alias of dbname, so it must not collide
+// with an explicit database= alias.
+func applyEnvironment(values map[string]string) {
+	for _, entry := range environmentParameters {
+		if _, set := values[entry.param]; set {
+			continue
+		}
+		if entry.param == "dbname" {
+			if _, set := values["database"]; set {
+				continue
+			}
+		}
+		if value := os.Getenv(entry.env); value != "" {
+			values[entry.param] = value
+		}
+	}
 }
 
 // parseKeywordDSN parses a libpq-style keyword/value DSN. Values may be
@@ -265,6 +334,14 @@ func newConfig(values map[string]string) (*Config, error) {
 			cfg.SSLMode = mode
 		case "sslrootcert":
 			cfg.SSLRootCert = value
+		case "sslcert":
+			cfg.SSLClientCert = value
+		case "sslkey":
+			cfg.SSLClientKey = value
+		case "sslpassword":
+			if value != "" {
+				return nil, errors.New("opengauss: sslpassword is not implemented: the driver supports only unencrypted sslkey files")
+			}
 		case "connect_timeout":
 			seconds, err := strconv.Atoi(value)
 			if err != nil || seconds < 0 {
@@ -276,7 +353,10 @@ func newConfig(values map[string]string) (*Config, error) {
 		}
 	}
 	if cfg.User == "" {
-		return nil, errors.New("opengauss: DSN is missing the required user parameter")
+		return nil, errors.New("opengauss: missing the required user parameter: set user in the DSN, PGUSER in the environment or a service file")
+	}
+	if (cfg.SSLClientCert == "") != (cfg.SSLClientKey == "") && cfg.SSLMode != SSLModeDisable {
+		return nil, errors.New("opengauss: sslcert and sslkey must be specified together")
 	}
 	if cfg.Database == "" {
 		cfg.Database = cfg.User

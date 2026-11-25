@@ -31,6 +31,14 @@ func (c *Config) buildTLSConfig() (*tls.Config, error) {
 		tlsConfig.InsecureSkipVerify = true
 	}
 
+	if c.SSLClientCert != "" {
+		certificate, err := tls.LoadX509KeyPair(c.SSLClientCert, c.SSLClientKey)
+		if err != nil {
+			return nil, fmt.Errorf("opengauss: load sslcert/sslkey: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{certificate}
+	}
+
 	if c.SSLRootCert != "" {
 		pemData, err := os.ReadFile(c.SSLRootCert)
 		if err != nil {

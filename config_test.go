@@ -8,6 +8,7 @@ import (
 )
 
 func TestParseConfigKeywordValue(t *testing.T) {
+	clearPGEnvironment(t)
 	dsn := "host=db.example.com port=15432 user=alice password='s3cr et' dbname=app sslmode=require sslrootcert=/etc/ssl/ca.pem connect_timeout=7"
 	cfg, err := parseConfig(dsn)
 	if err != nil {
@@ -40,6 +41,7 @@ func TestParseConfigKeywordValue(t *testing.T) {
 }
 
 func TestParseConfigEscapes(t *testing.T) {
+	clearPGEnvironment(t)
 	cfg, err := parseConfig(`user=alice password='pa\'ss' dbname=a\ b`)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -53,6 +55,7 @@ func TestParseConfigEscapes(t *testing.T) {
 }
 
 func TestParseConfigValueContainingURLScheme(t *testing.T) {
+	clearPGEnvironment(t)
 	cfg, err := parseConfig("user=alice password=x://y dbname=app")
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -63,6 +66,7 @@ func TestParseConfigValueContainingURLScheme(t *testing.T) {
 }
 
 func TestParseConfigURL(t *testing.T) {
+	clearPGEnvironment(t)
 	dsn := "postgres://alice:p%40ss@db.example.com:15432/app?sslmode=verify-full&sslrootcert=ca.pem&connect_timeout=5"
 	cfg, err := parseConfig(dsn)
 	if err != nil {
@@ -86,6 +90,7 @@ func TestParseConfigURL(t *testing.T) {
 }
 
 func TestParseConfigDefaults(t *testing.T) {
+	clearPGEnvironment(t)
 	cfg, err := parseConfig("user=alice")
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -105,6 +110,7 @@ func TestParseConfigDefaults(t *testing.T) {
 }
 
 func TestParseConfigLastValueWins(t *testing.T) {
+	clearPGEnvironment(t)
 	cfg, err := parseConfig("user=alice host=first host=second")
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -115,12 +121,13 @@ func TestParseConfigLastValueWins(t *testing.T) {
 }
 
 func TestParseConfigRejects(t *testing.T) {
+	clearPGEnvironment(t)
 	tests := []struct {
 		name    string
 		dsn     string
 		wantSub string
 	}{
-		{"empty", "", "empty DSN"},
+		{"empty without environment", "", "user"},
 		{"missing user", "host=localhost", "user"},
 		{"port not a number", "user=alice port=abc", "port"},
 		{"port zero", "user=alice port=0", "port"},
@@ -152,6 +159,7 @@ func TestParseConfigRejects(t *testing.T) {
 }
 
 func TestConfigStringRedactsPassword(t *testing.T) {
+	clearPGEnvironment(t)
 	cfg, err := parseConfig("user=alice password=topsecret host=localhost dbname=app")
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -166,6 +174,7 @@ func TestConfigStringRedactsPassword(t *testing.T) {
 }
 
 func TestParseConfigErrorDoesNotLeakPassword(t *testing.T) {
+	clearPGEnvironment(t)
 	_, err := parseConfig("user=alice password=topsecret port=notaport")
 	if err == nil {
 		t.Fatal("expected an error")
@@ -176,6 +185,7 @@ func TestParseConfigErrorDoesNotLeakPassword(t *testing.T) {
 }
 
 func TestURLParseErrorsDoNotLeakPassword(t *testing.T) {
+	clearPGEnvironment(t)
 	// url.Error would normally embed the whole DSN, password included.
 	dsns := []string{
 		"postgres://alice:topsecret@host:badport/db",
