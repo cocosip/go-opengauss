@@ -200,6 +200,94 @@ func TestPreparedStatementExec(t *testing.T) {
 	}
 }
 
+// TestPreparedStatementQuery exercises a prepared SELECT: database/sql must
+// bind the argument, describe the portal, execute and read the resulting rows.
+func TestPreparedStatementQuery(t *testing.T) {
+	const query = "SELECT c FROM t WHERE id = $1"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+
+		name := prepareStatement(t, s, query, 23)
+
+		statement, args := s.expectBindExecute()
+		if statement != name {
+			s.fail("bind target = %q, want %q", statement, name)
+		}
+		if len(args) != 1 || args[0].isNull || args[0].text != "7" {
+			s.fail("bound parameters = %+v, want text 7", args)
+		}
+		s.sendBindComplete()
+		s.sendRowDescription(fakeColumn{name: "c", oid: 23})
+		s.sendDataRow("42")
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+
+		closeStatement(s, name)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+
+	stmt, err := db.PrepareContext(ctx, query)
+	if err != nil {
+		t.Fatalf("PrepareContext: %v", err)
+	}
+	rows, err := stmt.QueryContext(ctx, 7)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("no row returned: %v", rows.Err())
+	}
+	var got int
+	if err := rows.Scan(&got); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if got != 42 {
+		t.Errorf("value = %d, want 42", got)
+	}
+	if rows.Next() {
+		t.Fatal("more than one row returned")
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("rows.Close: %v", err)
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatalf("stmt.Close: %v", err)
+	}
+}
+
+// TestSQLOpenUsesRegisteredDriver covers the documented sql.Open("opengauss")
+// entry point, where database/sql resolves the driver by name.
+func TestSQLOpenUsesRegisteredDriver(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if query := s.expectSimpleQuery(); query != "SELECT 1" {
+			s.fail("query = %q, want SELECT 1", query)
+		}
+		s.sendRowDescription(fakeColumn{name: "?column?", oid: 23})
+		s.sendDataRow("1")
+		s.sendCommandComplete("SELECT 1")
+		s.sendReady(proto.TxnIdle)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db, err := sql.Open("opengauss", testDSN(server, ""))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var got int
+	if err := db.QueryRowContext(testContext(t), "SELECT 1").Scan(&got); err != nil {
+		t.Fatalf("QueryRowContext: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("value = %d, want 1", got)
+	}
+}
+
 func TestTransactionRollbackAndReuse(t *testing.T) {
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)
