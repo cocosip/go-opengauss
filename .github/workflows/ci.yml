@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0
+
+  test:
+    name: test ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: go test
+        run: go test -count=1 ./...
+
+  race:
+    name: race
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: go test -race
+        run: go test -count=1 -race ./...
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: windows, goarch: amd64}
+          - {goos: darwin, goarch: amd64}
+          - {goos: darwin, goarch: arm64}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: build
+        run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
