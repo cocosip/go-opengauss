@@ -42,7 +42,13 @@ func lookupPassfile(path string, explicit bool, target Target, database, user st
 	if err != nil {
 		return "", fmt.Errorf("opengauss: parse passfile %q: %w", path, err)
 	}
-	password := passfile.FindPassword(target.Host, strconv.Itoa(target.Port), database, user)
+	// libpq matches the host field of a Unix-domain socket connection against
+	// localhost, because the socket directory is not a host name.
+	host := target.Host
+	if target.isUnix() {
+		host = "localhost"
+	}
+	password := passfile.FindPassword(host, strconv.Itoa(target.Port), database, user)
 	if strings.IndexByte(password, 0) >= 0 {
 		return "", fmt.Errorf("opengauss: passfile %q contains a NUL byte in a matched password", path)
 	}

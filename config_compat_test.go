@@ -215,6 +215,20 @@ func TestFallbackApplicationName(t *testing.T) {
 	}
 }
 
+func TestPassfileMatchesUnixSocketAsLocalhost(t *testing.T) {
+	clearPGEnvironment(t)
+	passfile := writeConfigFile(t, "pgpass", "localhost:5432:app:alice:socketsecret\n")
+	t.Setenv("PGPASSFILE", passfile)
+
+	cfg, err := parseConfig("host=/var/run/postgresql user=alice dbname=app")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.Password != "socketsecret" {
+		t.Errorf("Password = %q, want the passfile entry matched as localhost", cfg.Password)
+	}
+}
+
 func TestPassfileSuppliesPassword(t *testing.T) {
 	clearPGEnvironment(t)
 	passfile := writeConfigFile(t, "pgpass", `# host:port:database:user:password

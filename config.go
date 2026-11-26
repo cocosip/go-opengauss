@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -33,14 +34,42 @@ func (m SSLMode) valid() bool {
 	return false
 }
 
-// Target is one TCP endpoint. A connector tries its targets in order.
+// Target is one endpoint. A Host that starts with "/" names a Unix-domain
+// socket directory; every other host is a TCP address. A connector tries its
+// targets in order.
 type Target struct {
 	Host string
 	Port int
 }
 
-// String formats the target as host:port for errors and logs.
+// isUnix reports whether the target names a Unix-domain socket directory. The
+// socket file inside it is the conventional ".s.PGSQL.<port>", as in libpq.
+func (t Target) isUnix() bool {
+	return strings.HasPrefix(t.Host, "/")
+}
+
+// network returns the address family used to dial the target.
+func (t Target) network() string {
+	if t.isUnix() {
+		return "unix"
+	}
+	return "tcp"
+}
+
+// dialAddress returns the address passed to the dialer.
+func (t Target) dialAddress() string {
+	if t.isUnix() {
+		return filepath.Join(t.Host, ".s.PGSQL."+strconv.Itoa(t.Port))
+	}
+	return t.String()
+}
+
+// String formats the target for errors and logs: host:port, or the socket
+// directory for a Unix-domain socket.
 func (t Target) String() string {
+	if t.isUnix() {
+		return t.Host
+	}
 	return net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
 }
 

@@ -278,9 +278,9 @@ func connectOnce(ctx context.Context, cfg *Config, target Target, password strin
 }
 
 func dial(ctx context.Context, target Target) (net.Conn, error) {
-	dialer := net.Dialer{}
-	address := target.String()
-	netConn, err := dialer.DialContext(ctx, "tcp", address)
+	var dialer net.Dialer
+	address := target.dialAddress()
+	netConn, err := dialer.DialContext(ctx, target.network(), address)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			err = errors.Join(ctxErr, err)
@@ -288,6 +288,16 @@ func dial(ctx context.Context, target Target) (net.Conn, error) {
 		return nil, fmt.Errorf("dial %s: %w", address, err)
 	}
 	return netConn, nil
+}
+
+// tlsServerName returns the name used for certificate verification. A Unix
+// socket has no DNS name, so libpq treats verify-full there as verify-ca: the
+// chain is verified and the host name is not.
+func tlsServerName(target Target) string {
+	if target.isUnix() {
+		return ""
+	}
+	return target.Host
 }
 
 // contextCause reports the caller's context cause when it has ended, including
@@ -338,7 +348,7 @@ func (c *conn) negotiateTLS(ctx context.Context) error {
 		// The DNS name belongs to the endpoint actually dialed, which differs
 		// between targets.
 		tlsCfg := c.config.tlsConfig.Clone()
-		tlsCfg.ServerName = c.target.Host
+		tlsCfg.ServerName = tlsServerName(c.target)
 		tlsConn := tls.Client(c.netConn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -584,13 +594,17 @@ func (c *conn) sendCancelRequest() bool {
 	defer cancel()
 
 	// Cancel the exact peer this session is connected to. Re-resolving the
-	// host name could reach a different server where the key means nothing.
-	address := ""
+	// host name could reach a different server where the key means nothing,
+	// and a Unix socket has no TCP address to reuse.
+	network, address := "tcp", ""
 	if remote := c.netConn.RemoteAddr(); remote != nil {
 		address = remote.String()
 	}
+	if c.target.isUnix() {
+		network, address = "unix", c.target.dialAddress()
+	}
 	var dialer net.Dialer
-	netConn, err := dialer.DialContext(ctx, "tcp", address)
+	netConn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return false
 	}

@@ -2,10 +2,86 @@ package opengauss
 
 import (
 	"database/sql"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestParseConfigUnixSocket(t *testing.T) {
+	clearPGEnvironment(t)
+	cfg, err := parseConfig("host=/var/run/postgresql user=alice dbname=app")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	target := cfg.Targets[0]
+	if target.String() != "/var/run/postgresql" {
+		t.Errorf("target = %q, want the socket directory", target.String())
+	}
+	if target.network() != "unix" {
+		t.Errorf("network = %q, want unix", target.network())
+	}
+	if want := filepath.Join("/var/run/postgresql", ".s.PGSQL.5432"); target.dialAddress() != want {
+		t.Errorf("dial address = %q, want %q", target.dialAddress(), want)
+	}
+
+	cfg, err = parseConfig("host=/tmp port=6432 user=alice")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if want := filepath.Join("/tmp", ".s.PGSQL.6432"); cfg.Targets[0].dialAddress() != want {
+		t.Errorf("dial address = %q, want %q", cfg.Targets[0].dialAddress(), want)
+	}
+}
+
+func TestDialUnixSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-domain sockets are not available on Windows")
+	}
+	dir, err := os.MkdirTemp("", "opengauss-socket")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	listener, err := net.Listen("unix", filepath.Join(dir, ".s.PGSQL.5432"))
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	accepted := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		close(accepted)
+		_ = conn.Close()
+	}()
+
+	conn, err := dial(testContext(t), Target{Host: dir, Port: 5432})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = conn.Close()
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Unix socket server did not accept the connection")
+	}
+}
+
+func TestTLSServerName(t *testing.T) {
+	if got := tlsServerName(Target{Host: "/var/run/postgresql", Port: 5432}); got != "" {
+		t.Errorf("Unix socket server name = %q, want an empty name", got)
+	}
+	if got := tlsServerName(Target{Host: "db.example.com", Port: 5432}); got != "db.example.com" {
+		t.Errorf("TCP server name = %q, want db.example.com", got)
+	}
+}
 
 func TestParseConfigKeywordValue(t *testing.T) {
 	clearPGEnvironment(t)
