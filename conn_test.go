@@ -1512,6 +1512,10 @@ func TestConnectorRejectsUnreadableRootCert(t *testing.T) {
 }
 
 func TestPassfilePasswordAuthenticates(t *testing.T) {
+	// CI images may export PGPASSWORD (the Windows runner sets it to the
+	// preinstalled PostgreSQL superuser), which by libpq precedence would
+	// replace the passfile lookup under test.
+	clearPGEnvironment(t)
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)
 
@@ -1628,6 +1632,8 @@ func TestMultiHostStopsAfterAuthenticationFailure(t *testing.T) {
 }
 
 func TestMultiHostPassfileMatchesEachTarget(t *testing.T) {
+	// Keep an ambient PGPASSWORD from standing in for the per-target lookup.
+	clearPGEnvironment(t)
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)
 
