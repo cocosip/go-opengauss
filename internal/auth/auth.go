@@ -100,7 +100,7 @@ func Response(code int32, r *proto.ReadBuf, user, password string) ([]byte, erro
 	case RequestSM3:
 		return sm3Response(r, password)
 	case RequestGSS, RequestGSSContinue:
-		return nil, unsupported(code, "Kerberos/SPNEGO authentication is not implemented yet")
+		return nil, unsupported(code, "the connection layer handles GSSAPI with a provider registered by RegisterGSSProvider")
 	case RequestSSPI:
 		return nil, unsupported(code, "Windows integrated logon is not implemented yet")
 	default:

@@ -428,6 +428,15 @@ func (s *fakeSession) sendAuthenticationSM3(stored int32, salt, token string, it
 	s.writeRaw(m.Finish())
 }
 
+// sendAuthenticationGSS sends AuthenticationGSS (7) with an empty body, or
+// AuthenticationGSSContinue (8) with the server token.
+func (s *fakeSession) sendAuthenticationGSS(code int32, token []byte) {
+	m := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+	m.Int32(code)
+	m.Bytes(token)
+	s.writeRaw(m.Finish())
+}
+
 func (s *fakeSession) sendAuthenticationOK() {
 	s.writeRaw(authOKFrame())
 }

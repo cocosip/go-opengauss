@@ -82,6 +82,7 @@ Precedence is DSN > service file > environment > `.pgpass`, as in libpq.
 | `target_session_attrs` | `any`, `read-write`, `read-only`, `primary`, `standby`, `prefer-standby`. |
 | `application_name`, `fallback_application_name` | Startup `application_name`. |
 | `options` | Startup `options` command-line string. |
+| `krbsrvname`, `krbspn` | GSSAPI service name (default `postgres`) and an explicit service principal. |
 | `service`, `passfile` | Service file name and passfile path. |
 
 Environment variables: `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`,
@@ -121,8 +122,9 @@ including TLS fallbacks and later targets.
 ## Features
 
 - Authentication: cleartext, MD5, SHA256 (stored as plain, md5 or sha256),
-  MD5-SHA256 and SM3. GSS/SPNEGO, Windows SSPI and Lite SHA256_RFC are rejected
-  by method name.
+  MD5-SHA256 and SM3. GSSAPI requests 7/8 use the provider registered with
+  `RegisterGSSProvider`; Windows SSPI and Lite SHA256_RFC are rejected by method
+  name.
 - Queries: simple protocol for direct statements, extended protocol for
   prepared statements and parameters, multiple result sets from parameterless
   statement batches, transactions with isolation levels, context cancellation
@@ -155,8 +157,9 @@ including TLS fallbacks and later targets.
   representation.
 - Typed vector codecs and capability/version discovery wait for a live 6.x/7.x
   server.
-- GSS/SPNEGO, Windows integrated logon and Lite SHA256_RFC are not
-  implemented.
+- GSSAPI needs a provider registered with `RegisterGSSProvider`; the module
+  ships no Kerberos implementation. Windows integrated logon (SSPI) and Lite
+  SHA256_RFC are not implemented.
 - The driver registers only the `opengauss` name; the upstream `mogdb` alias
   is not registered.
 - `LastInsertId` is unsupported, and array/UUID/JSON values are not decoded

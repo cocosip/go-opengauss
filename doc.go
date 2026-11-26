@@ -35,6 +35,14 @@
 // A nil dial means net.Dialer; a CancelRequest still reaches the recorded peer
 // directly.
 //
+// # GSSAPI authentication
+//
+// RegisterGSSProvider supplies the GSSAPI context used for AuthenticationGSS.
+// The driver frames the provider's tokens but does not implement Kerberos
+// itself. krbsrvname overrides the service name, which defaults to postgres,
+// and krbspn names an explicit service principal. Requests 9 (SSPI) and 12
+// (Lite SHA256_RFC) remain unsupported.
+//
 // # Values
 //
 // Parameters and results use the server's text representation. The driver

@@ -86,6 +86,10 @@ type conn struct {
 	txnStatus   byte
 	stmtCounter int
 
+	// gss holds the provider context between AuthenticationGSS and its
+	// continuation messages.
+	gss GSS
+
 	// encodingErr records a client_encoding the driver cannot decode. The
 	// connection is unusable once it is set: text would arrive in an encoding
 	// the driver treats as UTF-8.
@@ -402,7 +406,7 @@ func (c *conn) startup(ctx context.Context) error {
 		return &stageError{stageStartup, err}
 	}
 
-	passwordSent := false
+	credentialsSent := false
 	for {
 		typ, body, err := c.recv()
 		if err != nil {
@@ -418,6 +422,20 @@ func (c *conn) startup(ctx context.Context) error {
 			if r.Err != nil {
 				return &stageError{stageAuthentication, r.Err}
 			}
+			switch code {
+			case auth.RequestGSS:
+				if err := c.startGSS(); err != nil {
+					return &stageError{stageAuthentication, err}
+				}
+				credentialsSent = true
+				continue
+			case auth.RequestGSSContinue:
+				if err := c.continueGSS(r); err != nil {
+					return &stageError{stageAuthentication, err}
+				}
+				credentialsSent = true
+				continue
+			}
 			payload, authErr := auth.Response(code, r, c.config.User, c.password)
 			if authErr != nil {
 				return &stageError{stageAuthentication, authErr}
@@ -426,12 +444,10 @@ func (c *conn) startup(ctx context.Context) error {
 				return &stageError{stageAuthentication, r.Err}
 			}
 			if payload != nil {
-				message := proto.NewMessageWriter(proto.MsgPasswordMessage)
-				message.Bytes(payload)
-				if err := c.sendFrames(message.Finish()); err != nil {
+				if err := c.sendPasswordMessage(payload); err != nil {
 					return &stageError{stageAuthentication, err}
 				}
-				passwordSent = true
+				credentialsSent = true
 			}
 		case proto.MsgParameterStatus:
 			c.storeParameter(body)
@@ -447,7 +463,7 @@ func (c *conn) startup(ctx context.Context) error {
 			// continue.
 		case proto.MsgErrorResponse:
 			stage := stageStartup
-			if passwordSent {
+			if credentialsSent {
 				stage = stageAuthentication
 			}
 			return &stageError{stage, parseErrorResponse(body)}
@@ -464,6 +480,58 @@ func (c *conn) startup(ctx context.Context) error {
 			return &stageError{stageStartup, fmt.Errorf("unexpected message type %q during startup", typ)}
 		}
 	}
+}
+
+// sendPasswordMessage writes one PasswordMessage with the given body.
+func (c *conn) sendPasswordMessage(payload []byte) error {
+	message := proto.NewMessageWriter(proto.MsgPasswordMessage)
+	message.Bytes(payload)
+	return c.sendFrames(message.Finish())
+}
+
+// startGSS answers AuthenticationGSS with the provider's initial token.
+func (c *conn) startGSS() error {
+	provider := currentGSSProvider()
+	if provider == nil {
+		return errors.New("opengauss: server requested GSSAPI authentication but no provider is registered; call RegisterGSSProvider")
+	}
+	client, err := provider()
+	if err != nil {
+		return fmt.Errorf("opengauss: create GSS provider: %w", err)
+	}
+	var token []byte
+	if spn := c.config.KrbSpn; spn != "" {
+		token, err = client.GetInitTokenFromSpn(spn)
+	} else {
+		service := c.config.KrbSrvname
+		if service == "" {
+			service = "postgres"
+		}
+		token, err = client.GetInitToken(c.target.Host, service)
+	}
+	if err != nil {
+		return fmt.Errorf("opengauss: GSSAPI initial token: %w", err)
+	}
+	if err := c.sendPasswordMessage(token); err != nil {
+		return err
+	}
+	c.gss = client
+	return nil
+}
+
+// continueGSS feeds one AuthenticationGSSContinue token to the provider.
+func (c *conn) continueGSS(r *proto.ReadBuf) error {
+	if c.gss == nil {
+		return errors.New("opengauss: server sent AuthenticationGSSContinue without AuthenticationGSS")
+	}
+	done, token, err := c.gss.Continue(r.Bytes(r.Remaining()))
+	if err != nil {
+		return fmt.Errorf("opengauss: GSSAPI continue: %w", err)
+	}
+	if done {
+		return nil
+	}
+	return c.sendPasswordMessage(token)
 }
 
 // errUnsupportedClientEncoding identifies a session whose client encoding the

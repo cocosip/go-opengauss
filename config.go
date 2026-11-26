@@ -124,6 +124,12 @@ type Config struct {
 	// Options is the libpq command-line string sent in the startup packet as
 	// options. An empty value means the parameter is omitted.
 	Options string
+	// KrbSrvname overrides the Kerberos service name requested from a GSS
+	// provider. An empty value means "postgres".
+	KrbSrvname string
+	// KrbSpn is an explicit service principal name that takes precedence over
+	// KrbSrvname and the target host.
+	KrbSpn string
 
 	// TargetSessionAttrs restricts which server roles a connection may use. The
 	// zero value means "any", which skips the role probe entirely.
@@ -557,6 +563,10 @@ func newConfig(values map[string]string) (*Config, error) {
 			fallbackApplicationName = value
 		case "options":
 			cfg.Options = value
+		case "krbsrvname":
+			cfg.KrbSrvname = value
+		case "krbspn":
+			cfg.KrbSpn = value
 		default:
 			return nil, fmt.Errorf("opengauss: unsupported connection parameter %q: it is not implemented yet and is rejected instead of being ignored", key)
 		}
