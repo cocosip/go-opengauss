@@ -514,8 +514,8 @@ func newConfig(values map[string]string) (*Config, error) {
 			cfg.Database = value
 		case "sslmode":
 			mode := SSLMode(value)
-			if !mode.valid() {
-				return nil, fmt.Errorf("opengauss: unsupported sslmode %q: use disable, allow, prefer, require, verify-ca or verify-full", value)
+			if !mode.valid() && !hasRegisteredTLSConfig(value) {
+				return nil, fmt.Errorf("opengauss: unsupported sslmode %q: use disable, allow, prefer, require, verify-ca, verify-full or a name registered with RegisterTLSConfig", value)
 			}
 			cfg.SSLMode = mode
 		case "target_session_attrs":

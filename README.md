@@ -102,6 +102,18 @@ postgres://app:secret@db1:5432/app?sslmode=prefer
 host=/var/run/postgresql user=app dbname=app
 ```
 
+For a TLS policy that the DSN cannot express, register a `*tls.Config` and use
+its name as `sslmode`:
+
+```go
+opengauss.RegisterTLSConfig("app", &tls.Config{RootCAs: roots})
+db, err := sql.Open("opengauss", "host=... user=... dbname=... sslmode=app")
+```
+
+The registered config is cloned for every physical connection; an empty
+`ServerName` is filled from the target, and the per-connection certificate
+parameters are not layered on top.
+
 ## Features
 
 - Authentication: cleartext, MD5, SHA256 (stored as plain, md5 or sha256),
@@ -113,9 +125,9 @@ host=/var/run/postgresql user=app dbname=app
   with a server-side CancelRequest, and `driver.Validator`/`SessionResetter`
   support for pooled connections.
 - TLS: all six `sslmode` values, client certificates, inline PEM material,
-  encrypted keys and verify-full host-name checks. `verify-full` verifies the
-  certificate chain without a host name over a Unix-domain socket, as libpq
-  does.
+  encrypted keys, registered `*tls.Config` policies (`RegisterTLSConfig`) and
+  verify-full host-name checks. `verify-full` verifies the certificate chain
+  without a host name over a Unix-domain socket, as libpq does.
 - Endpoints: multiple hosts tried in order, per-target TLS name checks and
   passfile matching, Unix-domain sockets, and `target_session_attrs` role
   selection.
@@ -141,8 +153,8 @@ host=/var/run/postgresql user=app dbname=app
   server.
 - GSS/SPNEGO, Windows integrated logon and Lite SHA256_RFC are not
   implemented.
-- A custom TLS config or dialer is not exposed; `sslmode` plus the certificate
-  parameters and the standard dialer cover the supported cases.
+- A custom dialer is not exposed; targets are dialed with `net.Dialer` and the
+  caller's context.
 - The driver registers only the `opengauss` name; the upstream `mogdb` alias
   is not registered.
 - `LastInsertId` is unsupported, and array/UUID/JSON values are not decoded

@@ -7,6 +7,77 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
+)
+
+// RegisterTLSConfig registers config under name, which can then be used as
+// the sslmode value. The config is cloned for every physical connection, so a
+// caller may keep modifying the original after registration. A non-empty
+// ServerName in config is preserved; an empty one is filled from the target
+// when the connection is opened.
+//
+// The reserved sslmode names and the boolean spellings libpq accepts are
+// rejected. Registering the same name again replaces the previous entry.
+func RegisterTLSConfig(name string, config *tls.Config) error {
+	if config == nil {
+		return errors.New("opengauss: RegisterTLSConfig needs a non-nil config")
+	}
+	if name == "" {
+		return errors.New("opengauss: RegisterTLSConfig needs a non-empty name")
+	}
+	if SSLMode(strings.ToLower(name)).valid() || isBoolName(name) {
+		return fmt.Errorf("opengauss: TLS config name %q is reserved", name)
+	}
+	tlsConfigsMu.Lock()
+	if tlsConfigs == nil {
+		tlsConfigs = make(map[string]*tls.Config)
+	}
+	tlsConfigs[name] = config
+	tlsConfigsMu.Unlock()
+	return nil
+}
+
+// DeregisterTLSConfig removes the config registered under name. Connections
+// that already opened keep the clone they were created with.
+func DeregisterTLSConfig(name string) {
+	tlsConfigsMu.Lock()
+	delete(tlsConfigs, name)
+	tlsConfigsMu.Unlock()
+}
+
+// isBoolName reports whether name is a boolean spelling that could otherwise
+// be mistaken for an sslmode value.
+func isBoolName(name string) bool {
+	switch strings.ToLower(name) {
+	case "1", "true", "0", "false":
+		return true
+	}
+	return false
+}
+
+// hasRegisteredTLSConfig reports whether name resolves to a registered config.
+func hasRegisteredTLSConfig(name string) bool {
+	tlsConfigsMu.RLock()
+	_, ok := tlsConfigs[name]
+	tlsConfigsMu.RUnlock()
+	return ok
+}
+
+// registeredTLSConfig returns a clone of the config registered under name.
+func registeredTLSConfig(name string) (*tls.Config, bool) {
+	tlsConfigsMu.RLock()
+	config, ok := tlsConfigs[name]
+	tlsConfigsMu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	return config.Clone(), true
+}
+
+var (
+	tlsConfigsMu sync.RWMutex
+	tlsConfigs   map[string]*tls.Config
 )
 
 // buildTLSConfig builds the client TLS configuration for the requested
@@ -30,6 +101,14 @@ func (c *Config) buildTLSConfig() (*tls.Config, error) {
 		}
 	case SSLModeAllow, SSLModePrefer:
 		tlsConfig.InsecureSkipVerify = true
+	default:
+		// A name registered with RegisterTLSConfig supplies its own policy,
+		// including certificates and roots.
+		registered, ok := registeredTLSConfig(string(c.SSLMode))
+		if !ok {
+			return nil, fmt.Errorf("opengauss: sslmode %q is not registered", c.SSLMode)
+		}
+		return registered, nil
 	}
 
 	if c.SSLClientCert != "" {

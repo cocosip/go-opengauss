@@ -21,6 +21,13 @@
 // fallback_application_name), and options, taken from the options key or
 // PGOPTIONS. A parameter is omitted when its resolved value is empty.
 //
+// # Custom TLS
+//
+// RegisterTLSConfig associates a *tls.Config with a name that can be used as
+// the sslmode value. The config is cloned for every physical connection, its
+// ServerName is used when set and otherwise filled from the target, and the
+// sslrootcert, sslcert and sslkey parameters are not applied to it.
+//
 // # Values
 //
 // Parameters and results use the server's text representation. The driver

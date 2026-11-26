@@ -348,7 +348,9 @@ func (c *conn) negotiateTLS(ctx context.Context) error {
 		// The DNS name belongs to the endpoint actually dialed, which differs
 		// between targets.
 		tlsCfg := c.config.tlsConfig.Clone()
-		tlsCfg.ServerName = tlsServerName(c.target)
+		if tlsCfg.ServerName == "" {
+			tlsCfg.ServerName = tlsServerName(c.target)
+		}
 		tlsConn := tls.Client(c.netConn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
