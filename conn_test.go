@@ -495,26 +495,38 @@ func TestFailedConnectLeavesPoolEmpty(t *testing.T) {
 }
 
 func TestUnsupportedAuthenticationMethod(t *testing.T) {
-	server := newFakeServer(t, func(s *fakeSession) {
-		s.readStartup()
-		s.sendAuthenticationRequest(auth.RequestGSS)
-	})
+	tests := []struct {
+		name string
+		code int32
+		want string
+	}{
+		{"SSPI", auth.RequestSSPI, "SSPI"},
+		{"Lite SHA256_RFC", auth.RequestLiteSHA256, "Lite SHA256_RFC"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newFakeServer(t, func(s *fakeSession) {
+				s.readStartup()
+				s.sendAuthenticationRequest(tt.code)
+			})
 
-	connector, err := NewConnector(testDSN(server, ""))
-	if err != nil {
-		t.Fatalf("NewConnector: %v", err)
-	}
-	_, err = connector.Connect(testContext(t))
-	if err == nil {
-		t.Fatal("expected an unsupported-authentication error")
-	}
-	for _, want := range []string{"authentication", "GSSAPI"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not mention %q", err, want)
-		}
-	}
-	if errors.Is(err, driver.ErrBadConn) {
-		t.Errorf("Connect returned driver.ErrBadConn: %v", err)
+			connector, err := NewConnector(testDSN(server, ""))
+			if err != nil {
+				t.Fatalf("NewConnector: %v", err)
+			}
+			_, err = connector.Connect(testContext(t))
+			if err == nil {
+				t.Fatal("expected an unsupported-authentication error")
+			}
+			for _, want := range []string{"authentication", tt.want} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+			if errors.Is(err, driver.ErrBadConn) {
+				t.Errorf("Connect returned driver.ErrBadConn: %v", err)
+			}
+		})
 	}
 }
 
