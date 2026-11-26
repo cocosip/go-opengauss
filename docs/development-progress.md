@@ -6,6 +6,10 @@ Baseline: 2026-11-24. Target module: `github.com/cocosip/go-opengauss`. Target t
 
 Change `[ ]` to `[x]` when an item's acceptance conditions are met. Append the implementation commit, command or report. Record partial work and missing environments on the unchecked line. Track live server results separately from implementation and cross-builds. For research or proposed extensions, record the scope decision and keep unimplemented capabilities visible.
 
+## Deferred scope
+
+- **TLS: deferred on 2026-11-26 by the owner's decision.** No further TLS work and no live TLS evidence until this entry is removed. The offline TLS implementation and its tests stay as they are and must keep passing; only new work and live runs stop. Deferred cases: a live `sslmode=require`, `verify-ca` and `verify-full` run; a real client certificate pair; inline PEM material read from real files; an encrypted `sslkey` unlocked by `sslpassword`; a mismatched-hostname `verify-full` failure; and the live `RegisterTLSConfig` path. While deferred, a live report may be recorded with `sslmode=disable` and its TLS column marked deferred. F01 and the live rows below keep their TLS cases open rather than checked.
+
 ## Completed research
 
 - [x] Compared local upstream branches, tags, authentication, OID changes and the multi-vector API.

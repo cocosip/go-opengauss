@@ -77,20 +77,20 @@ record the actual value and the server banner instead of assuming them.
 PowerShell:
 
 ```powershell
-$env:OPENGAUSS_DSN = 'host=127.0.0.1 port=8888 user=live_test password=LiveTest#2026 dbname=opengauss_live sslmode=require connect_timeout=10'
+$env:OPENGAUSS_DSN = 'host=127.0.0.1 port=8888 user=live_test password=LiveTest#2026 dbname=opengauss_live sslmode=disable connect_timeout=10'
 go test -run '^TestLiveFirstMilestone$' -v .
 ```
 
 bash:
 
 ```bash
-export OPENGAUSS_DSN='host=127.0.0.1 port=8888 user=live_test password=LiveTest#2026 dbname=opengauss_live sslmode=require connect_timeout=10'
+export OPENGAUSS_DSN='host=127.0.0.1 port=8888 user=live_test password=LiveTest#2026 dbname=opengauss_live sslmode=disable connect_timeout=10'
 go test -run '^TestLiveFirstMilestone$' -v .
 ```
 
-If the image has TLS disabled, run the first pass with `sslmode=disable` and
-record that; the TLS row stays open until a TLS-enabled run exists. Then run
-the full suite:
+`sslmode=disable` is deliberate while TLS is deferred: it keeps the run
+independent of certificate provisioning. A TLS-enabled pass can repeat the
+same suite later without changing the driver. Then run the full suite:
 
 ```bash
 go test -run '^TestLive' -v .
@@ -100,7 +100,12 @@ go test -run '^TestLive' -v .
 and `TestLiveCopyOut` skips when the account cannot create a table. A skip is
 not a pass; keep the matching feature row open and record the reason.
 
-## 5. TLS verification
+## 5. TLS verification (deferred)
+
+TLS work and live TLS evidence are deferred by the owner's decision; see
+[development-progress.md](development-progress.md#deferred-scope). Run the
+first passes with `sslmode=disable` and mark the TLS column deferred in the
+result. The steps below are kept for the run that resumes TLS.
 
 `sslmode=require` proves that TLS was negotiated but does not verify the
 server's identity. For `verify-ca` or `verify-full`:

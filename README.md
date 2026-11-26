@@ -153,6 +153,10 @@ including TLS fallbacks and later targets.
 
 - No live server acceptance has been recorded; every feature row in the
   tracker is still open for live evidence.
+- TLS work and live TLS evidence are deferred (owner's decision, 2026-11-26).
+  The six `sslmode` values, client certificates and verification work offline;
+  none has run against a real certificate yet. See the
+  [deferred scope](docs/development-progress.md#deferred-scope).
 - Binary result format and binary `COPY` are not implemented; use the text
   representation.
 - Typed vector codecs and capability/version discovery wait for a live 6.x/7.x
