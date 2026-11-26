@@ -150,7 +150,7 @@ func TestServiceFileErrors(t *testing.T) {
 		t.Errorf("malformed service file error = %v", err)
 	}
 
-	t.Setenv("PGSERVICEFILE", writeConfigFile(t, "pg_service.conf", "[svc]\nsslinline=true\n"))
+	t.Setenv("PGSERVICEFILE", writeConfigFile(t, "pg_service.conf", "[svc]\nsslcrl=revoked.pem\n"))
 	if _, err := parseConfig("service=svc"); err == nil || !strings.Contains(err.Error(), "unsupported connection parameter") {
 		t.Errorf("unsupported service parameter error = %v", err)
 	}
@@ -447,16 +447,24 @@ func TestClientCertificateParameters(t *testing.T) {
 		!strings.Contains(err.Error(), "sslcert and sslkey") {
 		t.Errorf("sslkey without sslcert error = %v", err)
 	}
-	if _, err := parseConfig("user=alice sslpassword=secret"); err == nil ||
-		!strings.Contains(err.Error(), "sslpassword") {
-		t.Errorf("sslpassword error = %v", err)
+	if _, err := parseConfig("user=alice sslinline=maybe"); err == nil ||
+		!strings.Contains(err.Error(), "sslinline") {
+		t.Errorf("invalid sslinline error = %v", err)
+	}
+
+	cfg, err := parseConfig("user=alice sslinline=true sslpassword=secret")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if !cfg.SSLInline || cfg.sslPassword != "secret" {
+		t.Errorf("inline/password settings = %t, %q", cfg.SSLInline, cfg.sslPassword)
 	}
 
 	certPEM, keyPEM := newTestCertificatePEM(t, []string{"db.example.com"}, nil)
 	certFile := writeConfigFile(t, "client.crt", string(certPEM))
 	keyFile := writeConfigFile(t, "client.key", string(keyPEM))
 
-	cfg, err := parseConfig("user=alice sslcert=" + filepath.ToSlash(certFile) + " sslkey=" + filepath.ToSlash(keyFile))
+	cfg, err = parseConfig("user=alice sslcert=" + filepath.ToSlash(certFile) + " sslkey=" + filepath.ToSlash(keyFile))
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
@@ -480,7 +488,7 @@ func TestConnectorRejectsUnreadableClientKey(t *testing.T) {
 	missingKey := filepath.Join(t.TempDir(), "missing.key")
 
 	_, err := NewConnector("user=alice sslmode=require sslcert=" + filepath.ToSlash(certFile) + " sslkey=" + filepath.ToSlash(missingKey))
-	if err == nil || !strings.Contains(err.Error(), "sslcert") {
+	if err == nil || !strings.Contains(err.Error(), "sslkey") {
 		t.Errorf("error = %v, want a client certificate error", err)
 	}
 }

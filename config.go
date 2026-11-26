@@ -100,17 +100,23 @@ func (a TargetSessionAttrs) valid() bool {
 type Config struct {
 	// Host and Port are the first entry of Targets, kept for the common
 	// single-endpoint case.
-	Host           string
-	Port           int
-	Targets        []Target
-	User           string
-	Password       string
-	Database       string
-	SSLMode        SSLMode
-	SSLRootCert    string
-	SSLClientCert  string
-	SSLClientKey   string
+	Host          string
+	Port          int
+	Targets       []Target
+	User          string
+	Password      string
+	Database      string
+	SSLMode       SSLMode
+	SSLRootCert   string
+	SSLClientCert string
+	SSLClientKey  string
+	// SSLInline treats the value of sslcert, sslkey and sslrootcert as PEM
+	// data instead of a file path.
+	SSLInline      bool
 	ConnectTimeout time.Duration
+	// sslPassword decrypts an encrypted sslkey PEM block. It is never included
+	// in errors or Config.String.
+	sslPassword string
 	// ApplicationName is sent in the startup packet as application_name after
 	// resolving fallback_application_name and PGAPPNAME. An empty value means
 	// the parameter is omitted.
@@ -524,10 +530,17 @@ func newConfig(values map[string]string) (*Config, error) {
 			cfg.SSLClientCert = value
 		case "sslkey":
 			cfg.SSLClientKey = value
-		case "sslpassword":
-			if value != "" {
-				return nil, errors.New("opengauss: sslpassword is not implemented: the driver supports only unencrypted sslkey files")
+		case "sslinline":
+			switch strings.ToLower(value) {
+			case "true", "1":
+				cfg.SSLInline = true
+			case "false", "0", "":
+				cfg.SSLInline = false
+			default:
+				return nil, fmt.Errorf("opengauss: invalid sslinline %q: use true or false", value)
 			}
+		case "sslpassword":
+			cfg.sslPassword = value
 		case "connect_timeout":
 			seconds, err := strconv.Atoi(value)
 			if err != nil || seconds < 0 {

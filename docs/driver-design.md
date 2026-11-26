@@ -56,13 +56,13 @@ These upstream options are rejected with an explicit error rather than ignored. 
 
 | Setting | Behaviour here | Migration |
 | --- | --- | --- |
-| `sslinline` | Rejected as an unsupported parameter | Write the certificate and key to files with owner-only permissions and pass `sslcert`/`sslkey` |
-| `sslpassword` | Rejected: only unencrypted key files are read | Decrypt the key once at configuration time, or use `crypto/tls` through a future custom-config entry point |
 | Custom `TLSConfig` | Not exposed; the driver derives one policy from `sslmode` plus the certificate parameters | Use one of the six `sslmode` values, `sslrootcert`, `sslcert` and `sslkey`; a programmatic TLS hook is a future extension |
 | Custom dialer, `DialFunc` | Not exposed; targets are dialed with `net.Dialer` and the caller's context | Resolve or proxy at the network layer; a dialer hook is a future extension |
 | `mogdb` driver name | Not registered | Change the driver name in `sql.Open` to `opengauss`; registering both names would duplicate the same implementation |
 
 The startup packet carries `user`, `database` and `client_encoding=UTF8`, plus `application_name` and `options` when they resolve to a non-empty value. `application_name` comes from the `application_name` DSN key, the service file or `PGAPPNAME`, and an empty value falls back to `fallback_application_name`; `options` comes from the `options` key or `PGOPTIONS`. Both are sent verbatim, with no client-side parsing.
+
+`sslinline=true` reads `sslcert`, `sslkey` and `sslrootcert` as PEM data instead of file paths, and `sslpassword` decrypts a legacy RFC 1423 encrypted `sslkey`. Both are validated when the Connector is built.
 
 Registering only one name is deliberate: `database/sql` keys drivers by name, so a second alias would silently create a second independent pool for the same database.
 

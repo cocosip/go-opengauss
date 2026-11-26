@@ -3,6 +3,7 @@ package opengauss
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
@@ -32,7 +33,22 @@ func (c *Config) buildTLSConfig() (*tls.Config, error) {
 	}
 
 	if c.SSLClientCert != "" {
-		certificate, err := tls.LoadX509KeyPair(c.SSLClientCert, c.SSLClientKey)
+		certPEM := []byte(c.SSLClientCert)
+		keyPEM := []byte(c.SSLClientKey)
+		if !c.SSLInline {
+			var err error
+			if certPEM, err = os.ReadFile(c.SSLClientCert); err != nil {
+				return nil, fmt.Errorf("opengauss: read sslcert: %w", err)
+			}
+			if keyPEM, err = os.ReadFile(c.SSLClientKey); err != nil {
+				return nil, fmt.Errorf("opengauss: read sslkey: %w", err)
+			}
+		}
+		keyPEM, err := decryptSSLKey(keyPEM, c.sslPassword)
+		if err != nil {
+			return nil, err
+		}
+		certificate, err := tls.X509KeyPair(certPEM, keyPEM)
 		if err != nil {
 			return nil, fmt.Errorf("opengauss: load sslcert/sslkey: %w", err)
 		}
@@ -40,9 +56,12 @@ func (c *Config) buildTLSConfig() (*tls.Config, error) {
 	}
 
 	if c.SSLRootCert != "" {
-		pemData, err := os.ReadFile(c.SSLRootCert)
-		if err != nil {
-			return nil, fmt.Errorf("opengauss: read sslrootcert: %w", err)
+		pemData := []byte(c.SSLRootCert)
+		if !c.SSLInline {
+			var err error
+			if pemData, err = os.ReadFile(c.SSLRootCert); err != nil {
+				return nil, fmt.Errorf("opengauss: read sslrootcert: %w", err)
+			}
 		}
 		roots := x509.NewCertPool()
 		if !roots.AppendCertsFromPEM(pemData) {
@@ -51,6 +70,29 @@ func (c *Config) buildTLSConfig() (*tls.Config, error) {
 		tlsConfig.RootCAs = roots
 	}
 	return tlsConfig, nil
+}
+
+// decryptSSLKey returns keyPEM with its legacy RFC 1423 encryption removed when
+// sslpassword was supplied. An unencrypted key is returned unchanged, so an
+// unused sslpassword is harmless.
+func decryptSSLKey(keyPEM []byte, password string) ([]byte, error) {
+	block, _ := pem.Decode(keyPEM)
+	//nolint:staticcheck // libpq and OpenSSL write RFC 1423 encrypted PEM keys.
+	if block == nil || !x509.IsEncryptedPEMBlock(block) {
+		return keyPEM, nil
+	}
+	if password == "" {
+		return nil, errors.New("opengauss: sslkey is encrypted but sslpassword was not supplied")
+	}
+	//nolint:staticcheck // libpq and OpenSSL write RFC 1423 encrypted PEM keys.
+	der, err := x509.DecryptPEMBlock(block, []byte(password))
+	if err != nil {
+		if errors.Is(err, x509.IncorrectPasswordError) {
+			return nil, errors.New("opengauss: sslpassword does not decrypt sslkey")
+		}
+		return nil, fmt.Errorf("opengauss: decrypt sslkey: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: block.Type, Bytes: der}), nil
 }
 
 // verifyCAOnly verifies the server chain without its host name, which matches

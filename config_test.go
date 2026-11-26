@@ -413,7 +413,7 @@ func TestParseConfigRejects(t *testing.T) {
 		{"port too large", "user=alice port=65536", "port"},
 		{"negative port", "user=alice port=-1", "port"},
 		{"bad sslmode", "user=alice sslmode=bogus", "sslmode"},
-		{"unsupported option", "user=alice sslinline=true", "sslinline"},
+		{"unsupported option", "user=alice sslcrl=revoked.pem", "sslcrl"},
 		{"bad target_session_attrs", "user=alice target_session_attrs=leader", "target_session_attrs"},
 		{"bad connect_timeout", "user=alice connect_timeout=soon", "connect_timeout"},
 		{"negative connect_timeout", "user=alice connect_timeout=-3", "connect_timeout"},
