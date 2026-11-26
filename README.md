@@ -114,6 +114,10 @@ The registered config is cloned for every physical connection; an empty
 `ServerName` is filled from the target, and the per-connection certificate
 parameters are not layered on top.
 
+For a custom network path, use `NewConnectorWithDialer`; the dialer receives
+the target network (`tcp` or `unix`) and address for every connection attempt,
+including TLS fallbacks and later targets.
+
 ## Features
 
 - Authentication: cleartext, MD5, SHA256 (stored as plain, md5 or sha256),
@@ -129,8 +133,8 @@ parameters are not layered on top.
   verify-full host-name checks. `verify-full` verifies the certificate chain
   without a host name over a Unix-domain socket, as libpq does.
 - Endpoints: multiple hosts tried in order, per-target TLS name checks and
-  passfile matching, Unix-domain sockets, and `target_session_attrs` role
-  selection.
+  passfile matching, Unix-domain sockets, custom dialers
+  (`NewConnectorWithDialer`) and `target_session_attrs` role selection.
 - Values: text parameters and results. The driver decodes bool, integers,
   floats, bytea, date, timestamp and timestamptz; every other type, including
   numeric, JSON/JSONB, UUID, arrays, enums and domains, is returned as the
@@ -153,8 +157,6 @@ parameters are not layered on top.
   server.
 - GSS/SPNEGO, Windows integrated logon and Lite SHA256_RFC are not
   implemented.
-- A custom dialer is not exposed; targets are dialed with `net.Dialer` and the
-  caller's context.
 - The driver registers only the `opengauss` name; the upstream `mogdb` alias
   is not registered.
 - `LastInsertId` is unsupported, and array/UUID/JSON values are not decoded

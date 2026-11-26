@@ -235,7 +235,7 @@ func connectForPolicy(ctx context.Context, cfg *Config, target Target, password 
 }
 
 func connectOnce(ctx context.Context, cfg *Config, target Target, password string, useTLS bool) (*conn, error) {
-	netConn, err := dial(ctx, target)
+	netConn, err := dial(ctx, target, cfg.dialFunc)
 	if err != nil {
 		return nil, &stageError{stageDial, err}
 	}
@@ -277,10 +277,13 @@ func connectOnce(ctx context.Context, cfg *Config, target Target, password strin
 	return c, nil
 }
 
-func dial(ctx context.Context, target Target) (net.Conn, error) {
-	var dialer net.Dialer
+func dial(ctx context.Context, target Target, dialFunc DialFunc) (net.Conn, error) {
+	if dialFunc == nil {
+		var dialer net.Dialer
+		dialFunc = dialer.DialContext
+	}
 	address := target.dialAddress()
-	netConn, err := dialer.DialContext(ctx, target.network(), address)
+	netConn, err := dialFunc(ctx, target.network(), address)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			err = errors.Join(ctxErr, err)

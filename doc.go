@@ -28,6 +28,13 @@
 // ServerName is used when set and otherwise filled from the target, and the
 // sslrootcert, sslcert and sslkey parameters are not applied to it.
 //
+// # Custom dialer
+//
+// NewConnectorWithDialer is NewConnector with a caller-supplied DialFunc used
+// for every connection attempt, including TLS fallbacks and later targets.
+// A nil dial means net.Dialer; a CancelRequest still reaches the recorded peer
+// directly.
+//
 // # Values
 //
 // Parameters and results use the server's text representation. The driver

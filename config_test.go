@@ -1,6 +1,7 @@
 package opengauss
 
 import (
+	"context"
 	"database/sql"
 	"net"
 	"os"
@@ -62,11 +63,19 @@ func TestDialUnixSocket(t *testing.T) {
 		_ = conn.Close()
 	}()
 
-	conn, err := dial(testContext(t), Target{Host: dir, Port: 5432})
+	var gotNetwork, gotAddress string
+	conn, err := dial(testContext(t), Target{Host: dir, Port: 5432}, func(ctx context.Context, network, address string) (net.Conn, error) {
+		gotNetwork, gotAddress = network, address
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, address)
+	})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	_ = conn.Close()
+	if gotNetwork != "unix" || gotAddress != filepath.Join(dir, ".s.PGSQL.5432") {
+		t.Errorf("dial target = %s %s, want unix %s", gotNetwork, gotAddress, filepath.Join(dir, ".s.PGSQL.5432"))
+	}
 	select {
 	case <-accepted:
 	case <-time.After(5 * time.Second):

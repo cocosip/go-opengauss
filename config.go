@@ -141,6 +141,10 @@ type Config struct {
 	// tlsConfig is prepared once by NewConnector, so certificate files are
 	// validated before any connection attempt. It is nil for sslmode=disable.
 	tlsConfig *tls.Config
+
+	// dialFunc opens network connections; nil means net.Dialer. Packets on a
+	// CancelRequest do not use it.
+	dialFunc DialFunc
 }
 
 // String returns a description of the endpoints with the password removed. It

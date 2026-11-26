@@ -56,7 +56,6 @@ The table records the upstream surface that this driver does not provide. Depend
 
 | Setting | Behaviour here | Migration |
 | --- | --- | --- |
-| Custom dialer, `DialFunc` | Not exposed; targets are dialed with `net.Dialer` and the caller's context | Resolve or proxy at the network layer; a dialer hook is a future extension |
 | `mogdb` driver name | Not registered | Change the driver name in `sql.Open` to `opengauss`; registering both names would duplicate the same implementation |
 
 The startup packet carries `user`, `database` and `client_encoding=UTF8`, plus `application_name` and `options` when they resolve to a non-empty value. `application_name` comes from the `application_name` DSN key, the service file or `PGAPPNAME`, and an empty value falls back to `fallback_application_name`; `options` comes from the `options` key or `PGOPTIONS`. Both are sent verbatim, with no client-side parsing.
@@ -64,6 +63,8 @@ The startup packet carries `user`, `database` and `client_encoding=UTF8`, plus `
 `sslinline=true` reads `sslcert`, `sslkey` and `sslrootcert` as PEM data instead of file paths, and `sslpassword` decrypts a legacy RFC 1423 encrypted `sslkey`. Both are validated when the Connector is built.
 
 `RegisterTLSConfig(name, *tls.Config)` makes `name` usable as an `sslmode` value. The config is cloned for every physical connection, an empty `ServerName` is filled from the target, and `sslrootcert`/`sslcert`/`sslkey` are not layered on top. `DeregisterTLSConfig` removes the entry; connections that already opened keep their clone.
+
+`NewConnectorWithDialer(dsn, dial)` uses a caller-supplied `DialFunc` for every connection attempt, including TLS fallbacks and later targets; a nil dial means `net.Dialer`. A CancelRequest still reaches the recorded peer directly.
 
 Registering only one name is deliberate: `database/sql` keys drivers by name, so a second alias would silently create a second independent pool for the same database.
 
