@@ -407,6 +407,27 @@ func (s *fakeSession) sendAuthenticationMD5(salt []byte) {
 	s.writeRaw(m.Finish())
 }
 
+// sendAuthenticationMD5SHA256 sends request 11 with its 64-character hex salt
+// and 4-byte MD5 salt.
+func (s *fakeSession) sendAuthenticationMD5SHA256(random64code string, salt []byte) {
+	m := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+	m.Int32(auth.RequestMD5SHA256)
+	m.Bytes([]byte(random64code))
+	m.Bytes(salt)
+	s.writeRaw(m.Finish())
+}
+
+// sendAuthenticationSM3 sends request 13, whose body matches request 10.
+func (s *fakeSession) sendAuthenticationSM3(stored int32, salt, token string, iteration int32) {
+	m := proto.NewMessageWriter(proto.MsgAuthenticationRequest)
+	m.Int32(auth.RequestSM3)
+	m.Int32(stored)
+	m.Bytes([]byte(salt))
+	m.Bytes([]byte(token))
+	m.Int32(iteration)
+	s.writeRaw(m.Finish())
+}
+
 func (s *fakeSession) sendAuthenticationOK() {
 	s.writeRaw(authOKFrame())
 }

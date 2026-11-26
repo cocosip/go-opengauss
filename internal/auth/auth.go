@@ -30,16 +30,17 @@ const (
 	RequestSM3         int32 = 13
 )
 
-// Password storage methods reported inside an AuthenticationSHA256Request.
+// Password storage methods reported inside an authenticated request.
 const (
 	StoredPlain  int32 = 0
 	StoredMD5    int32 = 1
 	StoredSHA256 int32 = 2
+	StoredSM3    int32 = 3
 )
 
-// maxSHA256Iterations caps the PBKDF2 work a server may demand. Real servers
+// maxProofIterations caps the PBKDF2 work a server may demand. Real servers
 // use 2048 or 10000 iterations; a hostile peer must not pin a CPU core.
-const maxSHA256Iterations = 1_000_000
+const maxProofIterations = 1_000_000
 
 // methodName describes an authentication request for errors and logs.
 func methodName(code int32) string {
@@ -93,11 +94,11 @@ func Response(code int32, r *proto.ReadBuf, user, password string) ([]byte, erro
 	case RequestSHA256:
 		return sha256Response(r, user, password)
 	case RequestMD5SHA256:
-		return nil, unsupported(code, "use a server that requests SHA256, MD5 or cleartext password authentication")
+		return md5SHA256Response(r, password)
 	case RequestLiteSHA256:
 		return nil, unsupported(code, "request 12 needs a matching Lite build and is not implemented yet")
 	case RequestSM3:
-		return nil, unsupported(code, "SM3 authentication is not implemented yet")
+		return sm3Response(r, password)
 	case RequestGSS, RequestGSSContinue:
 		return nil, unsupported(code, "Kerberos/SPNEGO authentication is not implemented yet")
 	case RequestSSPI:
@@ -143,9 +144,78 @@ func sha256Response(r *proto.ReadBuf, user, password string) ([]byte, error) {
 	}
 }
 
+// md5SHA256Response answers request 11: the server sends a 64-character hex
+// salt and a 4-byte MD5 salt, and the response carries the "md5" prefix.
+func md5SHA256Response(r *proto.ReadBuf, password string) ([]byte, error) {
+	if password == "" {
+		return nil, errors.New("server requested password authentication but the DSN supplied no password")
+	}
+	random64code := string(r.Bytes(64))
+	salt := r.Bytes(4)
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	proof, err := md5SHA256Proof(password, random64code, salt)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(proof), 0), nil
+}
+
+// md5SHA256Proof derives the request-11 proof used when the server stores an
+// MD5-SHA256 verifier. The layout matches the reference JDBC client:
+//
+//	K = PBKDF2-HMAC-SHA1(password, random64code, 2048, 32)
+//	proof = MD5(random64code + hex(HMAC-SHA256(K, "Sever Key")) +
+//	            hex(SHA256(HMAC-SHA256(K, "Client Key"))) + md5Salt)
+//
+// "Sever Key" is the server's misspelling and stays as it is on the wire.
+func md5SHA256Proof(password, random64code string, salt []byte) (string, error) {
+	random32code, err := hex.DecodeString(random64code)
+	if err != nil {
+		return "", fmt.Errorf("invalid random64code %q: %w", random64code, err)
+	}
+	key, err := pbkdf2.Key(sha1.New, password, random32code, 2048, sha256.Size)
+	if err != nil {
+		return "", fmt.Errorf("derive MD5-SHA256 authentication key: %w", err)
+	}
+	serverKey := hmacSHA256(key, []byte("Sever Key"))
+	clientKey := hmacSHA256(key, []byte("Client Key"))
+	storedKey := sha256.Sum256(clientKey)
+	encoded := random64code + hex.EncodeToString(serverKey) + hex.EncodeToString(storedKey[:])
+	sum := md5.Sum(append([]byte(encoded), salt...))
+	return "md5" + hex.EncodeToString(sum[:]), nil
+}
+
+// sm3Response answers request 13, whose layout matches request 10 but whose
+// stored key is hashed with SM3.
+func sm3Response(r *proto.ReadBuf, password string) ([]byte, error) {
+	storedMethod := r.Int32()
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	if storedMethod != StoredSM3 {
+		return nil, fmt.Errorf("unsupported stored password method %d: the server must store the password as sm3", storedMethod)
+	}
+	if password == "" {
+		return nil, errors.New("server requested password authentication but the DSN supplied no password")
+	}
+	random64code := string(r.Bytes(64))
+	token := string(r.Bytes(8))
+	iteration := int(r.Int32())
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	proof, err := sm3Proof(password, random64code, token, iteration)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(proof), 0), nil
+}
+
 // sha256Proof computes the RFC5802-style client proof used by openGauss
-// request 10. The server sends a 64-character hex salt, an 8-character hex
-// token and an iteration count; the proof is
+// request 10. The server sends a 64-char hex salt, an 8-char hex token and an
+// iteration count; the proof is
 //
 //	K = PBKDF2-HMAC-SHA1(password, salt, iterations, 32)
 //	clientKey = HMAC-SHA256(K, "Client Key")
@@ -155,11 +225,26 @@ func sha256Response(r *proto.ReadBuf, user, password string) ([]byte, error) {
 // misspelling included, to verify a server proof. Request 10 does not supply
 // one, so only the client key is derived here.
 func sha256Proof(password, random64code, token string, iteration int) (string, error) {
+	return rfc5802Proof(password, random64code, token, iteration, func(b []byte) []byte {
+		sum := sha256.Sum256(b)
+		return sum[:]
+	})
+}
+
+// sm3Proof is request 13's variant of the RFC5802 proof: only the stored key
+// uses SM3 instead of SHA-256.
+func sm3Proof(password, random64code, token string, iteration int) (string, error) {
+	return rfc5802Proof(password, random64code, token, iteration, sm3Sum)
+}
+
+// rfc5802Proof derives the client proof for requests 10 and 13. The caller
+// selects the hash that produces the stored key from the client key.
+func rfc5802Proof(password, random64code, token string, iteration int, storedHash func([]byte) []byte) (string, error) {
 	if password == "" {
-		return "", errors.New("empty password: the server requested SHA256 authentication")
+		return "", errors.New("empty password: the server requested password authentication")
 	}
-	if iteration <= 0 || iteration > maxSHA256Iterations {
-		return "", fmt.Errorf("invalid SHA256 iteration count %d", iteration)
+	if iteration <= 0 || iteration > maxProofIterations {
+		return "", fmt.Errorf("invalid authentication iteration count %d", iteration)
 	}
 	salt, err := hex.DecodeString(random64code)
 	if err != nil {
@@ -172,11 +257,11 @@ func sha256Proof(password, random64code, token string, iteration int) (string, e
 
 	key, err := pbkdf2.Key(sha1.New, password, salt, iteration, sha256.Size)
 	if err != nil {
-		return "", fmt.Errorf("derive SHA256 authentication key: %w", err)
+		return "", fmt.Errorf("derive authentication key: %w", err)
 	}
 	clientKey := hmacSHA256(key, []byte("Client Key"))
-	storedKey := sha256.Sum256(clientKey)
-	hmacResult := hmacSHA256(storedKey[:], tokenBytes)
+	storedKey := storedHash(clientKey)
+	hmacResult := hmacSHA256(storedKey, tokenBytes)
 
 	proof := make([]byte, sha256.Size)
 	for i := range proof {

@@ -542,6 +542,57 @@ func TestMD5Authentication(t *testing.T) {
 	_ = raw.(*conn).Close()
 }
 
+func TestMD5SHA256Authentication(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.readStartup()
+		s.sendAuthenticationMD5SHA256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", []byte{1, 2, 3, 4})
+		proof := s.expectPassword()
+		if want := "md5decfe7602711422c70372aeb7e53e4ab\x00"; string(proof) != want {
+			s.fail("MD5-SHA256 proof = %q, want %q", proof, want)
+		}
+		s.sendAuthenticationOK()
+		s.sendReady(proto.TxnIdle)
+	})
+
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=alice password=md5sha256@abc123 dbname=app sslmode=disable", server.port())
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	raw, err := connector.Connect(testContext(t))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = raw.(*conn).Close()
+}
+
+func TestSM3Authentication(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.readStartup()
+		s.sendAuthenticationSM3(3,
+			"5ae737626add65f8da1b063104a6c4e2dc25b7343d8512a74826dc5b5e3e5188",
+			"01020304", 10000)
+		proof := s.expectPassword()
+		want := "5ac942bc74b003ab3d818ac2bd1ef3fcc40becc45bf393d550e8aa9f7932f7e3\x00"
+		if string(proof) != want {
+			s.fail("SM3 proof = %q, want %q", proof, want)
+		}
+		s.sendAuthenticationOK()
+		s.sendReady(proto.TxnIdle)
+	})
+
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=alice password=sm3@abc123 dbname=app sslmode=disable", server.port())
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	raw, err := connector.Connect(testContext(t))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = raw.(*conn).Close()
+}
+
 func TestStartupHonorsContextDeadline(t *testing.T) {
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.readStartup()

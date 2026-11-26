@@ -97,6 +97,37 @@ func TestSHA256ProofRejectsBadInput(t *testing.T) {
 	}
 }
 
+// RequestMD5SHA256Body builds the body of an MD5-SHA256 authentication
+// request: a 64-character hex salt followed by a 4-byte MD5 salt.
+func RequestMD5SHA256Body(random64code string, salt []byte) []byte {
+	return append([]byte(random64code), salt...)
+}
+
+func TestMD5SHA256ProofKnownAnswer(t *testing.T) {
+	const random64code = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	got, err := md5SHA256Proof("md5sha256@abc123", random64code, []byte{1, 2, 3, 4})
+	if err != nil {
+		t.Fatalf("md5SHA256Proof: %v", err)
+	}
+	const want = "md5decfe7602711422c70372aeb7e53e4ab"
+	if got != want {
+		t.Errorf("proof = %s, want %s", got, want)
+	}
+}
+
+func TestSM3ProofKnownAnswer(t *testing.T) {
+	got, err := sm3Proof("sm3@abc123",
+		"5ae737626add65f8da1b063104a6c4e2dc25b7343d8512a74826dc5b5e3e5188",
+		"01020304", 10000)
+	if err != nil {
+		t.Fatalf("sm3Proof: %v", err)
+	}
+	const want = "5ac942bc74b003ab3d818ac2bd1ef3fcc40becc45bf393d550e8aa9f7932f7e3"
+	if got != want {
+		t.Errorf("proof = %s, want %s", got, want)
+	}
+}
+
 func TestMD5PasswordKnownAnswers(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -184,6 +215,73 @@ func TestAuthResponseSHA256RejectsTruncatedBody(t *testing.T) {
 	}
 }
 
+func TestAuthResponseMD5SHA256(t *testing.T) {
+	const random64code = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	body := RequestMD5SHA256Body(random64code, []byte{1, 2, 3, 4})
+	payload, err := Response(RequestMD5SHA256, &proto.ReadBuf{B: body}, "alice", "md5sha256@abc123")
+	if err != nil {
+		t.Fatalf("Response: %v", err)
+	}
+	if want := "md5decfe7602711422c70372aeb7e53e4ab\x00"; string(payload) != want {
+		t.Errorf("payload = %q, want %q", payload, want)
+	}
+}
+
+func TestAuthResponseMD5SHA256RejectsMissingPassword(t *testing.T) {
+	const random64code = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	body := RequestMD5SHA256Body(random64code, []byte{1, 2, 3, 4})
+	_, err := Response(RequestMD5SHA256, &proto.ReadBuf{B: body}, "alice", "")
+	if err == nil || !strings.Contains(err.Error(), "password") {
+		t.Fatalf("error = %v, want a missing-password error", err)
+	}
+}
+
+func TestAuthResponseMD5SHA256RejectsTruncatedBody(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	_, err := Response(RequestMD5SHA256, &proto.ReadBuf{B: body}, "alice", "pw")
+	if err == nil {
+		t.Fatal("expected an error for a truncated authentication request")
+	}
+}
+
+func TestAuthResponseSM3(t *testing.T) {
+	body := RequestSHA256Body(StoredSM3,
+		"5ae737626add65f8da1b063104a6c4e2dc25b7343d8512a74826dc5b5e3e5188",
+		"01020304", 10000)
+	payload, err := Response(RequestSM3, &proto.ReadBuf{B: body}, "alice", "sm3@abc123")
+	if err != nil {
+		t.Fatalf("Response: %v", err)
+	}
+	want := "5ac942bc74b003ab3d818ac2bd1ef3fcc40becc45bf393d550e8aa9f7932f7e3\x00"
+	if string(payload) != want {
+		t.Errorf("payload = %q, want %q", payload, want)
+	}
+}
+
+func TestAuthResponseSM3RejectsOtherStoredMethod(t *testing.T) {
+	body := RequestSHA256Body(StoredSHA256, katSalt, katToken, 10000)
+	_, err := Response(RequestSM3, &proto.ReadBuf{B: body}, "alice", "pw")
+	if err == nil || !strings.Contains(err.Error(), "stored password method") {
+		t.Fatalf("error = %v, want unsupported stored method", err)
+	}
+}
+
+func TestAuthResponseSM3RejectsMissingPassword(t *testing.T) {
+	body := RequestSHA256Body(StoredSM3, katSalt, katToken, 10000)
+	_, err := Response(RequestSM3, &proto.ReadBuf{B: body}, "alice", "")
+	if err == nil || !strings.Contains(err.Error(), "password") {
+		t.Fatalf("error = %v, want a missing-password error", err)
+	}
+}
+
+func TestAuthResponseSM3RejectsTruncatedBody(t *testing.T) {
+	body := binary.BigEndian.AppendUint32(nil, uint32(StoredSM3))
+	_, err := Response(RequestSM3, &proto.ReadBuf{B: body}, "alice", "pw")
+	if err == nil {
+		t.Fatal("expected an error for a truncated authentication request")
+	}
+}
+
 func TestAuthResponseOtherMethods(t *testing.T) {
 	cfg := creds{user: "alice", password: "alice"}
 
@@ -217,9 +315,7 @@ func TestAuthResponseUnsupportedMethods(t *testing.T) {
 		{RequestGSS, "GSSAPI"},
 		{RequestGSSContinue, "GSSAPI"},
 		{RequestSSPI, "SSPI"},
-		{RequestMD5SHA256, "MD5-SHA256"},
 		{RequestLiteSHA256, "Lite SHA256_RFC"},
-		{RequestSM3, "SM3"},
 		{99, "request 99"},
 	}
 	for _, tt := range tests {

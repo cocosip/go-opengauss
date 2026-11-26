@@ -43,7 +43,8 @@ unwrap, CEK wrap/unwrap, deterministic IV derivation and the ciphertext
 framing.
 
 Pure-Go feasibility: possible in principle (AES-CBC, HMAC-SHA256 and RSA are in
-the standard library; SM2/SM3/SM4 would add a dependency), but the openGauss
+the standard library; SM3 exists in the auth package, while SM2 and SM4 would
+add dependencies), but the openGauss
 docs describe CE only for `gsql` and JDBC and give no protocol or specification
 document, so an implementation would have to be derived from those clients'
 sources. That is a large, unverifiable offline effort with its own security
