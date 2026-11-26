@@ -13,6 +13,14 @@
 // Applications that need to resolve configuration before the first connection
 // can build a Connector with NewConnector and hand it to sql.OpenDB.
 //
+// # Startup parameters
+//
+// The startup packet sends user, database and client_encoding=UTF8. Two
+// optional libpq settings are supported: application_name, taken from the
+// application_name DSN key, the service file or PGAPPNAME (falling back to
+// fallback_application_name), and options, taken from the options key or
+// PGOPTIONS. A parameter is omitted when its resolved value is empty.
+//
 // # Values
 //
 // Parameters and results use the server's text representation. The driver

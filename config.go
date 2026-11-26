@@ -82,6 +82,13 @@ type Config struct {
 	SSLClientCert  string
 	SSLClientKey   string
 	ConnectTimeout time.Duration
+	// ApplicationName is sent in the startup packet as application_name after
+	// resolving fallback_application_name and PGAPPNAME. An empty value means
+	// the parameter is omitted.
+	ApplicationName string
+	// Options is the libpq command-line string sent in the startup packet as
+	// options. An empty value means the parameter is omitted.
+	Options string
 
 	// TargetSessionAttrs restricts which server roles a connection may use. The
 	// zero value means "any", which skips the role probe entirely.
@@ -198,6 +205,8 @@ var environmentParameters = []struct{ env, param string }{
 	{"PGSSLKEY", "sslkey"},
 	{"PGCONNECT_TIMEOUT", "connect_timeout"},
 	{"PGTARGETSESSIONATTRS", "target_session_attrs"},
+	{"PGAPPNAME", "application_name"},
+	{"PGOPTIONS", "options"},
 }
 
 // applyEnvironment fills parameters that neither the DSN nor the service file
@@ -448,6 +457,7 @@ func newConfig(values map[string]string) (*Config, error) {
 	cfg := &Config{
 		SSLMode: SSLModePrefer,
 	}
+	var fallbackApplicationName string
 	for key, value := range values {
 		if strings.IndexByte(value, 0) >= 0 {
 			return nil, fmt.Errorf("opengauss: connection parameter %q contains a NUL byte", key)
@@ -495,6 +505,12 @@ func newConfig(values map[string]string) (*Config, error) {
 				return nil, fmt.Errorf("opengauss: invalid connect_timeout %q: must be a non-negative number of seconds", value)
 			}
 			cfg.ConnectTimeout = time.Duration(seconds) * time.Second
+		case "application_name":
+			cfg.ApplicationName = value
+		case "fallback_application_name":
+			fallbackApplicationName = value
+		case "options":
+			cfg.Options = value
 		default:
 			return nil, fmt.Errorf("opengauss: unsupported connection parameter %q: it is not implemented yet and is rejected instead of being ignored", key)
 		}
@@ -513,6 +529,11 @@ func newConfig(values map[string]string) (*Config, error) {
 	}
 	if cfg.Database == "" {
 		cfg.Database = cfg.User
+	}
+	// fallback_application_name only applies when nothing supplied an
+	// application_name, as in libpq.
+	if cfg.ApplicationName == "" {
+		cfg.ApplicationName = fallbackApplicationName
 	}
 	return cfg, nil
 }

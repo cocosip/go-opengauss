@@ -16,6 +16,7 @@ func clearPGEnvironment(t *testing.T) {
 	for _, name := range []string{
 		"PGHOST", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD", "PGSSLMODE",
 		"PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGCONNECT_TIMEOUT", "PGTARGETSESSIONATTRS",
+		"PGAPPNAME", "PGOPTIONS",
 		"PGSERVICE", "PGSERVICEFILE", "PGPASSFILE",
 	} {
 		t.Setenv(name, "")
@@ -149,9 +150,68 @@ func TestServiceFileErrors(t *testing.T) {
 		t.Errorf("malformed service file error = %v", err)
 	}
 
-	t.Setenv("PGSERVICEFILE", writeConfigFile(t, "pg_service.conf", "[svc]\napplication_name=app\n"))
+	t.Setenv("PGSERVICEFILE", writeConfigFile(t, "pg_service.conf", "[svc]\nsslinline=true\n"))
 	if _, err := parseConfig("service=svc"); err == nil || !strings.Contains(err.Error(), "unsupported connection parameter") {
 		t.Errorf("unsupported service parameter error = %v", err)
+	}
+}
+
+func TestStartupParameterPrecedence(t *testing.T) {
+	clearPGEnvironment(t)
+	serviceFile := writeConfigFile(t, "pg_service.conf", `[svc]
+host=svchost
+user=svcuser
+application_name=svcapp
+`)
+	t.Setenv("PGSERVICEFILE", serviceFile)
+	t.Setenv("PGAPPNAME", "envapp")
+	t.Setenv("PGOPTIONS", "-c search_path=env")
+
+	cfg, err := parseConfig("service=svc")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.ApplicationName != "svcapp" {
+		t.Errorf("service application_name = %q, want svcapp", cfg.ApplicationName)
+	}
+	if cfg.Options != "-c search_path=env" {
+		t.Errorf("options from PGOPTIONS = %q", cfg.Options)
+	}
+
+	cfg, err = parseConfig("service=svc application_name=dsnapp options='-c search_path=dsn'")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.ApplicationName != "dsnapp" || cfg.Options != "-c search_path=dsn" {
+		t.Errorf("DSN startup parameters = %q %q, want dsnapp and the DSN options", cfg.ApplicationName, cfg.Options)
+	}
+}
+
+func TestFallbackApplicationName(t *testing.T) {
+	clearPGEnvironment(t)
+
+	cfg, err := parseConfig("host=db user=alice dbname=app fallback_application_name=fallback")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.ApplicationName != "fallback" {
+		t.Errorf("application_name = %q, want the fallback", cfg.ApplicationName)
+	}
+
+	cfg, err = parseConfig("host=db user=alice dbname=app application_name=explicit fallback_application_name=fallback")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.ApplicationName != "explicit" {
+		t.Errorf("application_name = %q, want the explicit value", cfg.ApplicationName)
+	}
+
+	cfg, err = parseConfig("host=db user=alice dbname=app application_name='' fallback_application_name=fallback")
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.ApplicationName != "fallback" {
+		t.Errorf("application_name = %q, want the fallback for an empty explicit value", cfg.ApplicationName)
 	}
 }
 

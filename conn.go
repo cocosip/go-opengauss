@@ -368,6 +368,12 @@ func startupFrame(cfg *Config) []byte {
 	appendStartupParameter("user", cfg.User)
 	appendStartupParameter("database", cfg.Database)
 	appendStartupParameter("client_encoding", "UTF8")
+	if cfg.ApplicationName != "" {
+		appendStartupParameter("application_name", cfg.ApplicationName)
+	}
+	if cfg.Options != "" {
+		appendStartupParameter("options", cfg.Options)
+	}
 	body = append(body, 0)
 
 	frame := binary.BigEndian.AppendUint32(nil, uint32(len(body)+4))

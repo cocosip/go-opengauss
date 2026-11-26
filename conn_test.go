@@ -128,6 +128,54 @@ func TestStartupKeepsSessionState(t *testing.T) {
 	}
 }
 
+func TestStartupSendsApplicationNameAndOptions(t *testing.T) {
+	clearPGEnvironment(t)
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(func(params map[string]string) {
+			if params["application_name"] != "checkout" {
+				s.fail("startup application_name = %q, want checkout", params["application_name"])
+			}
+			if params["options"] != "-c search_path=app" {
+				s.fail("startup options = %q, want the DSN options", params["options"])
+			}
+		})
+	})
+
+	connector, err := NewConnector(testDSN(server, `application_name=checkout options='-c search_path=app'`))
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	raw, err := connector.Connect(testContext(t))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = raw.Close()
+}
+
+func TestStartupOmitsUnsetStartupParameters(t *testing.T) {
+	clearPGEnvironment(t)
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(func(params map[string]string) {
+			if value, ok := params["application_name"]; ok {
+				s.fail("startup application_name = %q, want it omitted", value)
+			}
+			if value, ok := params["options"]; ok {
+				s.fail("startup options = %q, want it omitted", value)
+			}
+		})
+	})
+
+	connector, err := NewConnector(testDSN(server, ""))
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	raw, err := connector.Connect(testContext(t))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = raw.Close()
+}
+
 func TestBoundIntegerParameter(t *testing.T) {
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)
