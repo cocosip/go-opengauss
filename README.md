@@ -187,6 +187,7 @@ OPENGAUSS_DSN="host=... user=... password=... dbname=..." go test -run '^TestLiv
 - [Development tracker](docs/development-progress.md)
 - [Protocol research](docs/protocol-research.md)
 - [First connection milestone](docs/first-milestone.md)
+- [Live acceptance runbook](docs/live-acceptance.md)
 
 ## License
 

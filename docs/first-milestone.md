@@ -24,7 +24,7 @@ Drive the ordinary Connector through a local scripted peer with synthetic creden
 
 ## Live acceptance
 
-Use a disposable database on a chosen native-port build. The suggested first target is 7.0.0 LTS with SHA256 authentication and a TLS certificate whose hostname matches the DSN. Supply a test account, matching CA and permission to create temporary tables. Record actual availability when provisioning. A reference client can establish that the endpoint accepts the account and TLS policy before investigating a driver failure.
+Use a disposable database on a chosen native-port build. The suggested first target is 7.0.0 LTS with SHA256 authentication and a TLS certificate whose hostname matches the DSN. Supply a test account, matching CA and permission to create temporary tables. Record actual availability when provisioning. A reference client can establish that the endpoint accepts the account and TLS policy before investigating a driver failure. [live-acceptance.md](live-acceptance.md) has a container-based provisioning recipe, the DSN commands and a result template; it has not been executed in this workspace.
 
 1. Use both sql.Open and NewConnector/sql.OpenDB with the same DSN. Call PingContext with a deadline, read SELECT version(), then bind the integer 42 to `SELECT $1::integer` and assert Scan returns 42.
 2. Reserve one sql.Conn. Create a temporary table on it, begin a transaction on that connection, insert one row using a bound value, then roll back. Assert the row count is zero on the same connection, then close it. This avoids a pool switch hiding session or rollback errors.
