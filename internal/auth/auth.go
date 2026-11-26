@@ -74,8 +74,9 @@ func methodName(code int32) string {
 // The cursor must be positioned after the request code. It returns a nil
 // payload when the request needs no response.
 //
-// The openGauss-specific exchanges that are not implemented yet are rejected
-// with the method name instead of being silently skipped.
+// GSSAPI requests need a provider context that this package does not own, so
+// the connection layer handles 7/8. Exchanges that are still unimplemented are
+// rejected with the method name instead of being silently skipped.
 func Response(code int32, r *proto.ReadBuf, user, password string) ([]byte, error) {
 	switch code {
 	case OK:
