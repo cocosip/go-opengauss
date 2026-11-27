@@ -13,6 +13,7 @@ import (
 // under the wrong rules.
 type copyOutFormat struct {
 	csv       bool
+	binary    bool
 	header    bool
 	delimiter byte
 	quote     byte
@@ -36,10 +37,6 @@ func (f *copyOutFormat) useCSVDefaults() {
 	f.escape = '"'
 	f.null = nil
 }
-
-// errCopyOutBinary is reported when a copy-out stream would be binary, which the
-// driver never requests and cannot decode.
-var errCopyOutBinary = errors.New("opengauss: COPY ... TO STDOUT uses binary format, which this driver does not support; request FORMAT text or FORMAT csv")
 
 // errCopyInBinary is reported when a COPY ... FROM STDIN statement asks for a
 // binary stream, whose row encoding the driver does not implement.
@@ -334,41 +331,42 @@ func parseCopyBool(value string) (bool, error) {
 	return false, fmt.Errorf("opengauss: %q is not a boolean", value)
 }
 
-// copyOptionFormat reports whether the option list selects CSV. The legacy CSV
-// and BINARY words are format synonyms, and a binary stream is refused with the
-// message of the direction being parsed.
-func copyOptionFormat(options []copyOption, direction copyKind) (bool, error) {
-	csv := false
+// copyOptionKind is the representation an option list selects.
+type copyOptionKind int
+
+const (
+	copyOptionText copyOptionKind = iota
+	copyOptionCSV
+	copyOptionBinary
+)
+
+// copyOptionFormat reads the FORMAT option, including the legacy CSV and BINARY
+// words, so the rest of the option list can be checked against it.
+func copyOptionFormat(options []copyOption) (copyOptionKind, error) {
+	kind := copyOptionText
 	for _, option := range options {
 		switch option.name {
 		case "format":
 			if !option.hasValue {
-				return false, errors.New("opengauss: COPY option FORMAT needs a value")
+				return copyOptionText, errors.New("opengauss: COPY option FORMAT needs a value")
 			}
 			switch strings.ToLower(option.value) {
 			case "csv":
-				csv = true
+				kind = copyOptionCSV
 			case "text":
+				kind = copyOptionText
 			case "binary":
-				return false, copyBinaryError(direction)
+				kind = copyOptionBinary
 			default:
-				return false, fmt.Errorf("opengauss: unknown COPY format %q: use text or csv", option.value)
+				return copyOptionText, fmt.Errorf("opengauss: unknown COPY format %q: use text, csv or binary", option.value)
 			}
 		case "csv":
-			csv = true
+			kind = copyOptionCSV
 		case "binary":
-			return false, copyBinaryError(direction)
+			kind = copyOptionBinary
 		}
 	}
-	return csv, nil
-}
-
-// copyBinaryError names the direction a binary stream would run in.
-func copyBinaryError(direction copyKind) error {
-	if direction == copyIn {
-		return errCopyInBinary
-	}
-	return errCopyOutBinary
+	return kind, nil
 }
 
 // applyCopyOutOptions turns the parsed options into a decoder format. FORMAT is
@@ -376,12 +374,15 @@ func copyBinaryError(direction copyKind) error {
 // option is checked against what the decoder actually implements.
 func applyCopyOutOptions(options []copyOption) (copyOutFormat, error) {
 	format := textCopyOutFormat()
-	csv, err := copyOptionFormat(options, copyOut)
+	kind, err := copyOptionFormat(options)
 	if err != nil {
 		return copyOutFormat{}, err
 	}
-	if csv {
+	switch kind {
+	case copyOptionCSV:
 		format.useCSVDefaults()
+	case copyOptionBinary:
+		format.binary = true
 	}
 	// A single-byte option that does not default to the quote character yet.
 	escapeSet := false
@@ -463,12 +464,15 @@ func parseCopyInOptions(statement string, clauseEnd int) (CopyInOptions, error) 
 // applyCopyInOptions turns the parsed options into the representation the row
 // encoder must write.
 func applyCopyInOptions(options []copyOption) (CopyInOptions, error) {
-	csv, err := copyOptionFormat(options, copyIn)
+	kind, err := copyOptionFormat(options)
 	if err != nil {
 		return CopyInOptions{}, err
 	}
+	if kind == copyOptionBinary {
+		return CopyInOptions{}, errCopyInBinary
+	}
 	result := CopyInOptions{Format: CopyFormatText}
-	if csv {
+	if kind == copyOptionCSV {
 		result.Format = CopyFormatCSV
 	}
 	for _, option := range options {
@@ -484,7 +488,7 @@ func applyCopyInOptions(options []copyOption) (CopyInOptions, error) {
 				}
 				value = parsed
 			}
-			if !csv {
+			if kind != copyOptionCSV {
 				return CopyInOptions{}, errors.New("opengauss: COPY option HEADER is available only with FORMAT csv")
 			}
 			result.Header = value
@@ -493,7 +497,7 @@ func applyCopyInOptions(options []copyOption) (CopyInOptions, error) {
 			if err != nil {
 				return CopyInOptions{}, err
 			}
-			if !csv {
+			if kind != copyOptionCSV {
 				return CopyInOptions{}, fmt.Errorf("opengauss: COPY option %s is available only with FORMAT csv", strings.ToUpper(option.name))
 			}
 			switch option.name {
@@ -505,7 +509,7 @@ func applyCopyInOptions(options []copyOption) (CopyInOptions, error) {
 				result.Escape = value
 			}
 		case "null":
-			if !csv {
+			if kind != copyOptionCSV {
 				return CopyInOptions{}, errors.New("opengauss: COPY option NULL is available only with FORMAT csv")
 			}
 			if !option.hasValue {

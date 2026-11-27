@@ -658,14 +658,14 @@ func (s *fakeSession) sendCopyInResponse(format byte, columns int) {
 }
 
 // sendCopyOutResponse announces the row width of a COPY ... TO STDOUT stream.
-// The overall format selects text or binary; the columns are announced as text
-// because the driver never asks the server for binary output.
+// The overall format selects text or binary, and every column carries the same
+// format because COPY does not support a mixed stream.
 func (s *fakeSession) sendCopyOutResponse(format byte, columns int) {
 	m := proto.NewMessageWriter(proto.MsgCopyOutResponse)
 	m.Byte(format)
 	m.Int16(int16(columns))
 	for i := 0; i < columns; i++ {
-		m.Int16(0)
+		m.Int16(int16(format))
 	}
 	s.writeRaw(m.Finish())
 }

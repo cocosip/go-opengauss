@@ -2,6 +2,7 @@ package opengauss
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"reflect"
@@ -155,7 +156,9 @@ func TestCopyOutEarlyCloseDiscardsRemainingRows(t *testing.T) {
 	}
 }
 
-func TestCopyOutRejectsBinaryFormat(t *testing.T) {
+// TestCopyOutRejectsUnrequestedBinaryStream proves a text statement that gets a
+// binary stream is stopped instead of misread, and the session is resynchronized.
+func TestCopyOutRejectsUnrequestedBinaryStream(t *testing.T) {
 	const query = "COPY demotable TO STDOUT"
 	var server *fakeServer
 	server = newFakeServer(t, func(s *fakeSession) {
@@ -179,8 +182,40 @@ func TestCopyOutRejectsBinaryFormat(t *testing.T) {
 	db := openTestDB(t, testDSN(server, ""))
 	ctx := testContext(t)
 	_, err := db.QueryContext(ctx, query)
-	if err == nil || !strings.Contains(err.Error(), "binary format") {
-		t.Fatalf("QueryContext = %v, want a binary-format refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "did not ask for one") {
+		t.Fatalf("QueryContext = %v, want a binary-stream refusal", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+// TestCopyOutRejectsTextStreamForBinaryStatement proves a binary statement whose
+// server answers in text is refused rather than decoded under the wrong rules.
+func TestCopyOutRejectsTextStreamForBinaryStatement(t *testing.T) {
+	const query = "COPY demotable TO STDOUT WITH (FORMAT binary)"
+	var server *fakeServer
+	server = newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 2)
+		select {
+		case <-server.cancels:
+		case <-time.After(5 * time.Second):
+			s.fail("no cancel request arrived")
+			return
+		}
+		s.sendError("57014", "canceling statement due to user request")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	_, err := db.QueryContext(ctx, query)
+	if err == nil || !strings.Contains(err.Error(), "asked for binary") {
+		t.Fatalf("QueryContext = %v, want a text-stream refusal", err)
 	}
 	if err := db.PingContext(ctx); err != nil {
 		t.Fatalf("PingContext: %v", err)
@@ -493,8 +528,8 @@ func TestCopyOutUnconfirmedCancelDiscardsSession(t *testing.T) {
 	db := openTestDB(t, testDSN(server, ""))
 	ctx := testContext(t)
 	_, err := db.QueryContext(ctx, query)
-	if err == nil || !strings.Contains(err.Error(), "binary format") {
-		t.Fatalf("QueryContext = %v, want a binary-format refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "did not ask for one") {
+		t.Fatalf("QueryContext = %v, want a binary-stream refusal", err)
 	}
 	// The cancel was not confirmed before the grace period, so the session
 	// must not be handed to another statement.
@@ -709,9 +744,10 @@ func TestParseCopyOutOptions(t *testing.T) {
 		// ESCAPE defaults to the quote character the statement selected.
 		{statement: "COPY t TO STDOUT WITH (FORMAT csv, QUOTE '~')",
 			want: modifiedCSVCopyOutFormat(',', '~', '~', "")},
-		{statement: "COPY t TO STDOUT WITH (FORMAT binary)", err: "binary format"},
-		{statement: "COPY t TO STDOUT BINARY", err: "binary format"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT binary)", want: binaryCopyOutFormat()},
+		{statement: "COPY t TO STDOUT BINARY", want: binaryCopyOutFormat()},
 		{statement: "COPY t TO STDOUT WITH (FORMAT xsv)", err: "unknown COPY format"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT binary, HEADER)", err: "HEADER is available only with FORMAT csv"},
 		{statement: "COPY t TO STDOUT WITH (ENCODING 'UTF8')", err: "ENCODING is not implemented"},
 		{statement: "COPY t TO STDOUT WITH (HEADER)", err: "HEADER is available only with FORMAT csv"},
 		{statement: "COPY t TO STDOUT WITH (DELIMITER '|')", err: "DELIMITER is available only with FORMAT csv"},
@@ -750,6 +786,13 @@ func csvCopyOutFormat(header ...bool) copyOutFormat {
 	if len(header) > 0 {
 		format.header = header[0]
 	}
+	return format
+}
+
+// binaryCopyOutFormat is the expected format of a binary statement.
+func binaryCopyOutFormat() copyOutFormat {
+	format := textCopyOutFormat()
+	format.binary = true
 	return format
 }
 
@@ -1019,5 +1062,205 @@ func TestCopyOutCSVRowsAcrossManyFrames(t *testing.T) {
 	}
 	if count != total {
 		t.Fatalf("rows = %d, want %d", count, total)
+	}
+}
+
+// copyBinaryHeaderBytes builds the header of a COPY BINARY stream, with an
+// optional extension area.
+func copyBinaryHeaderBytes(extension []byte) []byte {
+	buf := append([]byte(nil), copyBinarySignature...)
+	buf = binary.BigEndian.AppendUint32(buf, 0)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(extension)))
+	return append(buf, extension...)
+}
+
+// copyBinaryTupleBytes builds one COPY BINARY tuple. A nil field is NULL and a
+// string or []byte field is written with its length prefix.
+func copyBinaryTupleBytes(fields ...any) []byte {
+	buf := binary.BigEndian.AppendUint16(nil, uint16(len(fields)))
+	for _, field := range fields {
+		switch value := field.(type) {
+		case nil:
+			buf = binary.BigEndian.AppendUint32(buf, 0xffffffff)
+		case string:
+			buf = binary.BigEndian.AppendUint32(buf, uint32(len(value)))
+			buf = append(buf, value...)
+		case []byte:
+			buf = binary.BigEndian.AppendUint32(buf, uint32(len(value)))
+			buf = append(buf, value...)
+		default:
+			panic("copyBinaryTupleBytes: unsupported field")
+		}
+	}
+	return buf
+}
+
+// copyBinaryTrailerBytes ends the tuples of a COPY BINARY stream.
+func copyBinaryTrailerBytes() []byte {
+	return binary.BigEndian.AppendUint16(nil, 0xffff)
+}
+
+func TestConsumeCopyBinaryHeader(t *testing.T) {
+	if _, ok, err := consumeCopyBinaryHeader(nil); ok || err != nil {
+		t.Fatalf("an empty buffer = ok %v, err %v, want a wait", ok, err)
+	}
+	unknown := append([]byte("NOTACOPY!!!"), make([]byte, 8)...)
+	if _, ok, err := consumeCopyBinaryHeader(unknown); ok || err == nil ||
+		!strings.Contains(err.Error(), "signature") {
+		t.Fatalf("unknown signature = ok %v, err %v", ok, err)
+	}
+
+	header := copyBinaryHeaderBytes(nil)
+	consumed, ok, err := consumeCopyBinaryHeader(append(header, 1, 2))
+	if !ok || err != nil || consumed != len(header) {
+		t.Fatalf("plain header = %d, ok %v, err %v, want %d", consumed, ok, err, len(header))
+	}
+	if _, ok, err := consumeCopyBinaryHeader(header[:len(header)-1]); ok || err != nil {
+		t.Fatalf("truncated header = ok %v, err %v, want a wait", ok, err)
+	}
+
+	// The extension area is skipped, so a tagged stream is still readable.
+	extended := copyBinaryHeaderBytes([]byte("future"))
+	consumed, ok, err = consumeCopyBinaryHeader(extended)
+	if !ok || err != nil || consumed != len(extended) {
+		t.Fatalf("extended header = %d, ok %v, err %v, want %d", consumed, ok, err, len(extended))
+	}
+
+	flagged := copyBinaryHeaderBytes(nil)
+	binary.BigEndian.PutUint32(flagged[len(copyBinarySignature):], 1)
+	if _, _, err := consumeCopyBinaryHeader(flagged); err == nil ||
+		!strings.Contains(err.Error(), "flags") {
+		t.Fatalf("flagged header error = %v, want an unsupported-flags error", err)
+	}
+
+	negative := copyBinaryHeaderBytes(nil)
+	binary.BigEndian.PutUint32(negative[len(copyBinarySignature)+4:], 0xffffffff)
+	if _, _, err := consumeCopyBinaryHeader(negative); err == nil ||
+		!strings.Contains(err.Error(), "negative") {
+		t.Fatalf("negative extension error = %v, want a negative-length error", err)
+	}
+}
+
+func TestParseCopyBinaryTuple(t *testing.T) {
+	tuple := copyBinaryTupleBytes("1", []byte{}, nil)
+	fields, consumed, ended, ok, err := parseCopyBinaryTuple(tuple, 3)
+	if !ok || err != nil || ended || consumed != len(tuple) {
+		t.Fatalf("tuple = %d consumed, ok %v, ended %v, err %v", consumed, ok, ended, err)
+	}
+	if len(fields) != 3 || string(fields[0].value) != "1" ||
+		fields[0].null || fields[1].null || len(fields[1].value) != 0 || !fields[2].null {
+		t.Fatalf("fields = %#v", fields)
+	}
+	if _, _, _, ok, err := parseCopyBinaryTuple(tuple[:len(tuple)-1], 3); ok || err != nil {
+		t.Fatalf("truncated tuple = ok %v, err %v, want a wait", ok, err)
+	}
+
+	trailer := copyBinaryTrailerBytes()
+	if _, consumed, ended, ok, err := parseCopyBinaryTuple(trailer, 3); !ok || !ended ||
+		consumed != 2 || err != nil {
+		t.Fatalf("trailer = %d consumed, ok %v, ended %v, err %v", consumed, ok, ended, err)
+	}
+
+	if _, _, _, _, err := parseCopyBinaryTuple(copyBinaryTupleBytes("1"), 3); err == nil ||
+		!strings.Contains(err.Error(), "1 fields") {
+		t.Fatalf("wrong width error = %v, want a field-count error", err)
+	}
+
+	invalid := binary.BigEndian.AppendUint16(nil, 1)
+	invalid = binary.BigEndian.AppendUint32(invalid, 0xfffffffe)
+	if _, _, _, _, err := parseCopyBinaryTuple(invalid, 1); err == nil ||
+		!strings.Contains(err.Error(), "invalid field length") {
+		t.Fatalf("invalid length error = %v, want a length error", err)
+	}
+}
+
+func TestCopyOutBinaryHasCompleteRow(t *testing.T) {
+	header := copyBinaryHeaderBytes(nil)
+	onlyHeader := &copyOutRows{format: binaryCopyOutFormat(), columns: 1}
+	onlyHeader.pending = header
+	if onlyHeader.hasCompleteRow() {
+		t.Fatal("a header alone was counted as a row")
+	}
+	complete := &copyOutRows{format: binaryCopyOutFormat(), columns: 1}
+	complete.pending = append(append([]byte(nil), header...), copyBinaryTupleBytes("a")...)
+	if !complete.hasCompleteRow() {
+		t.Fatal("a complete tuple behind the header was not detected")
+	}
+	partial := &copyOutRows{format: binaryCopyOutFormat(), columns: 1, binaryHeader: true}
+	partial.pending = copyBinaryTupleBytes("a")[:4]
+	if partial.hasCompleteRow() {
+		t.Fatal("a partial tuple was counted as a row")
+	}
+}
+
+func TestCopyOutBinaryStreamsRows(t *testing.T) {
+	const query = "COPY demotable TO STDOUT WITH (FORMAT binary)"
+	stream := copyBinaryHeaderBytes([]byte("future"))
+	stream = append(stream, copyBinaryTupleBytes("1", []byte{0, 1, 2}, nil)...)
+	stream = append(stream, copyBinaryTupleBytes("2", []byte{}, "x")...)
+	stream = append(stream, copyBinaryTrailerBytes()...)
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if got := s.expectSimpleQuery(); got != query {
+			s.fail("query = %q, want %q", got, query)
+			return
+		}
+		s.sendCopyOutResponse(1, 3)
+		// Five-byte frames cut the header, the length prefixes and the values
+		// at every possible boundary.
+		for offset := 0; offset < len(stream); {
+			size := 5
+			if offset+size > len(stream) {
+				size = len(stream) - offset
+			}
+			s.sendCopyData(string(stream[offset : offset+size]))
+			offset += size
+		}
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 2")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		t.Fatalf("ColumnTypes: %v", err)
+	}
+	if want := reflect.TypeOf([]byte(nil)); types[0].ScanType() != want {
+		t.Fatalf("ScanType = %v, want %v", types[0].ScanType(), want)
+	}
+	var got [][]any
+	for rows.Next() {
+		var a, b, c any
+		if err := rows.Scan(&a, &b, &c); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got = append(got, []any{a, b, c})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	want := [][]any{
+		{[]byte("1"), []byte{0, 1, 2}, nil},
+		{[]byte("2"), []byte{}, []byte("x")},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows = %#v, want %#v", got, want)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+	if server.connections() != 1 {
+		t.Errorf("connections = %d, want the same session reused", server.connections())
 	}
 }

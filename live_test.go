@@ -3,6 +3,7 @@ package opengauss
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -419,6 +420,40 @@ func TestLiveCopyOut(t *testing.T) {
 	wantLabels := []any{"one", nil, "line\nbreak", `comma, "quote"`}
 	if !reflect.DeepEqual(gotIn, wantLabels) {
 		t.Fatalf("labels = %#v, want %#v", gotIn, wantLabels)
+	}
+
+	// Binary output returns the raw field bytes: an int4 is four big-endian
+	// bytes and text is UTF-8, because the protocol names no types.
+	rows, err = db.QueryContext(ctx, "COPY "+table+" (id, label) TO STDOUT WITH (FORMAT binary)")
+	if err != nil {
+		t.Fatalf("COPY TO STDOUT binary: %v", err)
+	}
+	binaryLabels := map[uint32]any{}
+	for rows.Next() {
+		var id, label any
+		if err := rows.Scan(&id, &label); err != nil {
+			t.Fatalf("Scan binary: %v", err)
+		}
+		raw, ok := id.([]byte)
+		if !ok || len(raw) != 4 {
+			t.Fatalf("binary id = %#v, want four bytes", id)
+		}
+		binaryLabels[binary.BigEndian.Uint32(raw)] = label
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err binary: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close binary: %v", err)
+	}
+	wantBinary := map[uint32]any{
+		1: []byte("one"),
+		2: nil,
+		3: []byte("tab\there"),
+		4: []byte(`comma, "quote"`),
+	}
+	if !reflect.DeepEqual(binaryLabels, wantBinary) {
+		t.Fatalf("binary labels = %#v, want %#v", binaryLabels, wantBinary)
 	}
 }
 

@@ -592,6 +592,9 @@ func parseCopyResponse(body []byte) (format byte, columns int, err error) {
 		if columnFormat != 0 && format == 0 {
 			return 0, 0, fmt.Errorf("opengauss: COPY column %d uses binary format, which this driver does not request", i+1)
 		}
+		if columnFormat != 1 && format == 1 {
+			return 0, 0, fmt.Errorf("opengauss: COPY column %d uses text format in a binary stream", i+1)
+		}
 	}
 	if r.Err != nil {
 		return 0, 0, proto.ErrMalformedMessage

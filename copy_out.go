@@ -21,17 +21,21 @@ var maxCopyOutRow = 64 << 20
 // copyOutRows streams the rows of a COPY ... TO STDOUT statement read through
 // QueryContext. The COPY protocol carries no column names or type OIDs, so the
 // columns are reported as column1..columnN and every value is a string (NULL is
-// nil): neither the text nor the CSV format can say more. The session stays
-// pinned to the statement until the rows reach ReadyForQuery or are closed.
+// nil) in the text and CSV formats. A binary stream is returned field by field
+// as []byte, because nothing in the protocol says how to decode a value without
+// its type. The session stays pinned to the statement until the rows reach
+// ReadyForQuery or are closed.
 type copyOutRows struct {
-	conn       *conn
-	columns    int
-	format     copyOutFormat
-	headerDone bool
-	ctx        context.Context
-	watcher    *cancelWatcher
-	pending    []byte
-	done       bool
+	conn         *conn
+	columns      int
+	format       copyOutFormat
+	headerDone   bool
+	binaryHeader bool
+	binaryDone   bool
+	ctx          context.Context
+	watcher      *cancelWatcher
+	pending      []byte
+	done         bool
 }
 
 func (r *copyOutRows) Columns() []string {
@@ -42,9 +46,12 @@ func (r *copyOutRows) Columns() []string {
 	return names
 }
 
-// ColumnTypeScanType implements driver.RowsColumnTypeScanType: a COPY text
-// field is always scanned as a string.
+// ColumnTypeScanType implements driver.RowsColumnTypeScanType: a COPY text or
+// CSV field is scanned as a string and a binary field as []byte.
 func (r *copyOutRows) ColumnTypeScanType(int) reflect.Type {
+	if r.format.binary {
+		return reflect.TypeOf([]byte(nil))
+	}
 	return reflect.TypeOf("")
 }
 
@@ -213,6 +220,9 @@ type copyField struct {
 
 // takeRow removes one complete row from the buffer and returns its fields.
 func (r *copyOutRows) takeRow() ([]copyField, bool, error) {
+	if r.format.binary {
+		return r.takeBinaryRow()
+	}
 	fields, consumed, ok, err := parseCopyOutRow(r.pending, r.format)
 	if err != nil || !ok {
 		return nil, false, err
@@ -224,18 +234,66 @@ func (r *copyOutRows) takeRow() ([]copyField, bool, error) {
 	return fields, true, nil
 }
 
+// takeBinaryRow reads the stream header once and then one tuple per call. The
+// trailer ends the tuples, after which the stream is drained to ReadyForQuery.
+func (r *copyOutRows) takeBinaryRow() ([]copyField, bool, error) {
+	if r.binaryDone {
+		return nil, false, nil
+	}
+	if !r.binaryHeader {
+		consumed, ok, err := consumeCopyBinaryHeader(r.pending)
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		r.pending = r.pending[consumed:]
+		r.binaryHeader = true
+		if len(r.pending) == 0 {
+			r.pending = nil
+		}
+	}
+	fields, consumed, ended, ok, err := parseCopyBinaryTuple(r.pending, r.columns)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	r.pending = r.pending[consumed:]
+	if len(r.pending) == 0 {
+		r.pending = nil
+	}
+	if ended {
+		r.binaryDone = true
+		return nil, false, nil
+	}
+	return fields, true, nil
+}
+
 // hasCompleteRow reports whether the buffer already holds one whole row, which
 // keeps the row cap from rejecting a frame that carries several complete rows.
 func (r *copyOutRows) hasCompleteRow() bool {
-	if !r.format.csv {
+	switch {
+	case r.format.binary:
+		if r.binaryDone {
+			return false
+		}
+		buffer := r.pending
+		if !r.binaryHeader {
+			consumed, ok, _ := consumeCopyBinaryHeader(buffer)
+			if !ok {
+				return false
+			}
+			buffer = buffer[consumed:]
+		}
+		_, _, _, ok, _ := parseCopyBinaryTuple(buffer, r.columns)
+		return ok
+	case r.format.csv:
+		_, _, ok, _ := parseCopyOutRow(r.pending, r.format)
+		return ok
+	default:
 		return bytes.IndexByte(r.pending, '\n') >= 0
 	}
-	_, _, ok, _ := parseCopyOutRow(r.pending, r.format)
-	return ok
 }
 
-// decodeRow writes one row's fields into dest: a NULL field is nil and every
-// other field is the decoded text.
+// decodeRow writes one row's fields into dest: a NULL field is nil, a binary
+// field is a copy of its bytes, and every other field is the decoded text.
 func (r *copyOutRows) decodeRow(fields []copyField, dest []driver.Value) error {
 	if len(dest) != r.columns {
 		return fmt.Errorf("opengauss: a COPY ... TO STDOUT row has %d columns but the destination has %d", r.columns, len(dest))
@@ -244,11 +302,16 @@ func (r *copyOutRows) decodeRow(fields []copyField, dest []driver.Value) error {
 		return fmt.Errorf("opengauss: a COPY ... TO STDOUT row has %d fields but the stream announced %d columns", len(fields), r.columns)
 	}
 	for i, field := range fields {
-		if field.null {
+		switch {
+		case field.null:
 			dest[i] = nil
-			continue
+		case r.format.binary:
+			value := make([]byte, len(field.value))
+			copy(value, field.value)
+			dest[i] = value
+		default:
+			dest[i] = string(field.value)
 		}
-		dest[i] = string(field.value)
 	}
 	return nil
 }
@@ -481,17 +544,24 @@ func (c *conn) queryCopyOut(ctx context.Context, statement string, format copyOu
 				c.endOperation(watcher)
 				return nil, err
 			}
-			if streamFormat != 0 {
-				// A binary stream cannot be decoded here. Copy-out mode cannot
-				// be ended from the frontend, so a cancel request stops the
-				// server before the remaining data is discarded.
+			wantStream := byte(0)
+			if format.binary {
+				wantStream = 1
+			}
+			if streamFormat != wantStream {
+				// The announced stream cannot be decoded with the statement's
+				// options. Copy-out cannot be ended from the frontend, so a
+				// cancel request stops the server before the rest is discarded.
 				c.copying = true
 				c.copyWatcher = watcher
 				c.copyCtx = ctx
 				if stopErr := c.abortCopyOut(); stopErr != nil {
 					return nil, c.wrapIOError(ctx, "copy out", stopErr)
 				}
-				return nil, errCopyOutBinary
+				if wantStream == 1 {
+					return nil, errors.New("opengauss: the server announced a text COPY ... TO STDOUT stream for a statement that asked for binary")
+				}
+				return nil, errors.New("opengauss: the server announced a binary COPY ... TO STDOUT stream for a statement that did not ask for one")
 			}
 			c.copying = true
 			c.copyOwner = nil
