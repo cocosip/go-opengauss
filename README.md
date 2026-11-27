@@ -155,7 +155,9 @@ including TLS fallbacks and later targets.
   reports the product release. openGauss keeps a PostgreSQL-compatible
   `server_version`, so the banner is the value that identifies the build.
 - `NewListener` keeps a dedicated LISTEN/NOTIFY session and reconnects with
-  backoff.
+  backoff. Because openGauss delivers a published notification with the next
+  statement's response instead of waking an idle client, an idle listening
+  session is probed once a second so notifications arrive promptly.
 - `ExecuteMultiSearch` runs a vector query per argument set on pinned sessions
   and restores scan parameters afterwards.
 
