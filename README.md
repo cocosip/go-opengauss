@@ -139,9 +139,13 @@ including TLS fallbacks and later targets.
   (`NewConnectorWithDialer`) and `target_session_attrs` role selection.
 - Values: text parameters and results. The driver decodes bool, integers,
   floats, bytea, date, timestamp and timestamptz; every other type, including
-  numeric, JSON/JSONB, UUID, arrays, enums and domains, is returned as the
-  exact server text. `ColumnTypes` reports declared lengths and numeric
-  precision/scale when the server sends a type modifier.
+  numeric, JSON/JSONB, UUID, arrays, enums, domains and vectors, is returned
+  as the exact server text. `ColumnTypes` reports declared lengths, numeric
+  precision/scale when the server sends a type modifier, and the type name for
+  the known scalar types, the array types (named after their element, such as
+  `int4[]`) and the 7.x `vector`, `halfvec` and `sparsevec`; a
+  user-defined type, a domain or an enum reports an empty name rather than a
+  guess.
 - `CopyIn` streams text rows with `COPY ... FROM STDIN`, and
   `CopyInWithOptions` streams CSV, with `HEADER`, `DELIMITER`, `QUOTE`,
   `ESCAPE` and `NULL`; a hand-written `COPY ... FROM STDIN` statement is read
@@ -171,8 +175,8 @@ including TLS fallbacks and later targets.
   [deferred scope](docs/development-progress.md#deferred-scope).
 - Binary result format and binary `COPY` are not implemented; use the text
   representation.
-- Typed vector codecs and capability/version discovery wait for a live 6.x/7.x
-  server.
+- A vector is bound and read as text, which the official guide also does; a
+  typed vector codec and the 6.x dataVec type names are not implemented.
 - GSSAPI needs a provider registered with `RegisterGSSProvider`; the module
   ships no Kerberos implementation. Windows integrated logon (SSPI) and Lite
   SHA256_RFC are not implemented.
