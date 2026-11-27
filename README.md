@@ -142,9 +142,11 @@ including TLS fallbacks and later targets.
   numeric, JSON/JSONB, UUID, arrays, enums and domains, is returned as the
   exact server text. `ColumnTypes` reports declared lengths and numeric
   precision/scale when the server sends a type modifier.
-- `CopyIn` streams text rows with `COPY ... FROM STDIN`; `COPY ... TO STDOUT`
-  is read through `QueryContext` in the default text format or in CSV, including
-  `HEADER`, `DELIMITER`, `QUOTE`, `ESCAPE` and `NULL`.
+- `CopyIn` streams text rows with `COPY ... FROM STDIN`, and
+  `CopyInWithOptions` streams CSV, with `HEADER`, `DELIMITER`, `QUOTE`,
+  `ESCAPE` and `NULL`; a hand-written `COPY ... FROM STDIN` statement is read
+  with the options it states. `COPY ... TO STDOUT` is read through
+  `QueryContext` in either format.
 - `DetectServerVersion` reads the `SELECT version()` banner once per session and
   reports the product release. openGauss keeps a PostgreSQL-compatible
   `server_version`, so the banner is the value that identifies the build.
