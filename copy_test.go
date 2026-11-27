@@ -186,7 +186,11 @@ func TestCopyInOptionErrors(t *testing.T) {
 		{`COPY "logs" FROM STDIN WITH (FORMAT binary)`, "binary format"},
 		{`COPY "logs" FROM STDIN BINARY`, "binary format"},
 		{`COPY "logs" FROM STDIN WITH (FORMAT xsv)`, "unknown COPY format"},
-		{`COPY "logs" FROM STDIN WITH (ENCODING 'UTF8')`, "ENCODING is not implemented"},
+		{`COPY "logs" FROM STDIN WITH (ENCODING 'GBK')`, "ENCODING \"GBK\" is not implemented"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, FORCE_QUOTE *)`, "TO STDOUT only"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL (a))`, "no column names"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, FORCE_NULL (a))`, "no column names"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, FORCE QUOTE a)`, "use WITH (FORCE_QUOTE ...)"},
 		{`COPY "logs" FROM STDIN WITH (HEADER)`, "HEADER is available only with FORMAT csv"},
 		{`COPY "logs" FROM STDIN WITH (DELIMITER '|')`, "DELIMITER is available only with FORMAT csv"},
 		{`COPY "logs" FROM STDIN WITH (FORMAT csv, DELIMITER '||')`, "one single-byte character"},
@@ -213,6 +217,16 @@ func TestCopyInOptionErrors(t *testing.T) {
 	want := CopyInOptions{Format: CopyFormatText}
 	if options != want {
 		t.Errorf("options = %#v, want %#v", options, want)
+	}
+	// ENCODING is accepted when it names the text the driver writes.
+	const encoded = `COPY "logs" FROM STDIN WITH (FORMAT csv, ENCODING 'UTF8')`
+	_, clauseEnd := copyDirection(encoded)
+	options, err = parseCopyInOptions(encoded, clauseEnd)
+	if err != nil {
+		t.Fatalf("parseCopyInOptions with ENCODING: %v", err)
+	}
+	if options.Format != CopyFormatCSV {
+		t.Errorf("options = %#v, want the CSV format", options)
 	}
 }
 
@@ -627,7 +641,9 @@ func TestCopyInRejectsUnimplementedOptions(t *testing.T) {
 		err       string
 	}{
 		{`COPY "logs" FROM STDIN WITH (FORMAT binary)`, "binary format"},
-		{`COPY "logs" FROM STDIN WITH (ENCODING 'UTF8')`, "ENCODING is not implemented"},
+		{`COPY "logs" FROM STDIN WITH (ENCODING 'GBK')`, "ENCODING \"GBK\" is not implemented"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, FORCE_QUOTE *)`, "TO STDOUT only"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, FORCE_NULL (a))`, "no column names"},
 		{`COPY "logs" FROM STDIN WITH (HEADER)`, "HEADER is available only with FORMAT csv"},
 	} {
 		if _, err := tx.PrepareContext(ctx, test.statement); err == nil ||

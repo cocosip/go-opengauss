@@ -112,8 +112,13 @@
 // ESCAPE and NULL options, in the WITH (...) form and in the legacy bare form.
 // A FORMAT binary statement returns every field as []byte holding the server's
 // binary value, with NULL as nil, because the COPY protocol carries no type
-// OIDs. An option the decoder cannot honour, such as ENCODING, is refused when
-// the statement is issued rather than read under the wrong rules.
+// OIDs. FORCE_QUOTE is accepted, since it only adds quotes the CSV decoder
+// already handles, while FORCE_NOT_NULL and FORCE_NULL are refused because they
+// change how an empty field reads and the protocol carries no column names to
+// apply them to. An ENCODING value is accepted only when it names the UTF-8 or
+// SQL_ASCII text the driver exchanges, and any other option the decoder cannot
+// honour is refused when the statement is issued rather than read under the
+// wrong rules.
 //
 // NewListener keeps one dedicated session for LISTEN/NOTIFY and reconnects it
 // after a failure, re-registering the channels it had accepted. It is separate

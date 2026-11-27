@@ -225,16 +225,19 @@ func isCopyOptionNameByte(c byte) bool {
 	return false
 }
 
-// readCopyOptionValue reads a quoted string or an unquoted word. A quoted value
-// uses the standard SQL rule that a doubled quote stands for one quote, and an
-// E” string additionally expands the backslash escapes the driver emits for a
-// control character or a quote.
+// readCopyOptionValue reads a quoted string, a parenthesized column list or an
+// unquoted word. A quoted value uses the standard SQL rule that a doubled quote
+// stands for one quote, and an E” string additionally expands the backslash
+// escapes the driver emits for a control character or a quote.
 func readCopyOptionValue(statement string, i int) (string, int, error) {
 	if i >= len(statement) {
 		return "", i, errors.New("a value is missing")
 	}
 	if statement[i] == '\'' {
 		return readCopyQuotedValue(statement, i+1, false)
+	}
+	if statement[i] == '(' {
+		return readCopyColumnList(statement, i)
 	}
 	if (statement[i] == 'E' || statement[i] == 'e') && i+1 < len(statement) && statement[i+1] == '\'' {
 		return readCopyQuotedValue(statement, i+2, true)
@@ -298,6 +301,28 @@ func unescapeCopyOptionByte(c byte) byte {
 	return c
 }
 
+// readCopyColumnList skips a parenthesized column list, such as the one
+// FORCE_QUOTE takes, and returns its body. The list is not interpreted: the
+// server is the authority on its validity, and a list of columns only changes
+// how values are formatted, not how they are decoded.
+func readCopyColumnList(statement string, start int) (string, int, error) {
+	i := start + 1
+	for {
+		i = skipSpaceAndComments(statement, i)
+		if i >= len(statement) {
+			return "", i, errors.New("the column list is not closed")
+		}
+		switch statement[i] {
+		case ')':
+			return statement[start+1 : i], i + 1, nil
+		case '"', '\'':
+			i = skipQuoted(statement, i, statement[i])
+		default:
+			i++
+		}
+	}
+}
+
 // readCopyBoolValue reads a boolean option value when one is present.
 func readCopyBoolValue(statement string, i int) (string, int, bool) {
 	start := i
@@ -314,10 +339,23 @@ func readCopyBoolValue(statement string, i int) (string, int, bool) {
 // copyOptionNeedsValue reports whether an option is always followed by a value.
 func copyOptionNeedsValue(name string) bool {
 	switch name {
-	case "format", "delimiter", "quote", "escape", "null":
+	case "format", "delimiter", "quote", "escape", "null", "encoding", "force_quote", "force_not_null", "force_null":
 		return true
 	}
 	return false
+}
+
+// checkCopyEncoding accepts an ENCODING value only when it names the UTF-8 or
+// SQL_ASCII text the driver already speaks: any other encoding changes the
+// bytes of every field without changing the decoder.
+func checkCopyEncoding(value string) error {
+	normalized := strings.ToLower(value)
+	normalized = strings.NewReplacer("_", "", "-", "", " ", "").Replace(normalized)
+	switch normalized {
+	case "utf8", "unicode", "sqlascii":
+		return nil
+	}
+	return fmt.Errorf("opengauss: COPY option ENCODING %q is not implemented: the driver exchanges UTF-8 and SQL_ASCII text only", value)
 }
 
 // parseCopyBool accepts the spellings SQL uses for a boolean option value.
@@ -428,6 +466,26 @@ func applyCopyOutOptions(options []copyOption) (copyOutFormat, error) {
 				return copyOutFormat{}, errors.New("opengauss: COPY option NULL needs a value")
 			}
 			format.null = []byte(option.value)
+		case "encoding":
+			if !option.hasValue {
+				return copyOutFormat{}, errors.New("opengauss: COPY option ENCODING needs a value")
+			}
+			if err := checkCopyEncoding(option.value); err != nil {
+				return copyOutFormat{}, err
+			}
+		case "force_quote":
+			if !format.csv {
+				return copyOutFormat{}, errors.New("opengauss: COPY option FORCE_QUOTE is available only with FORMAT csv")
+			}
+			if !option.hasValue {
+				return copyOutFormat{}, errors.New("opengauss: COPY option FORCE_QUOTE needs a value")
+			}
+			// FORCE_QUOTE only adds quotes around the listed columns, which the
+			// CSV decoder already reads, so the list needs no interpretation.
+		case "force_not_null", "force_null":
+			return copyOutFormat{}, forceNullOptionError(option.name)
+		case "force":
+			return copyOutFormat{}, errLegacyForceOption
 		default:
 			return copyOutFormat{}, fmt.Errorf("opengauss: COPY option %s is not implemented", strings.ToUpper(option.name))
 		}
@@ -516,12 +574,36 @@ func applyCopyInOptions(options []copyOption) (CopyInOptions, error) {
 				return CopyInOptions{}, errors.New("opengauss: COPY option NULL needs a value")
 			}
 			result.Null = option.value
+		case "encoding":
+			if !option.hasValue {
+				return CopyInOptions{}, errors.New("opengauss: COPY option ENCODING needs a value")
+			}
+			if err := checkCopyEncoding(option.value); err != nil {
+				return CopyInOptions{}, err
+			}
+		case "force_quote":
+			return CopyInOptions{}, errors.New("opengauss: COPY option FORCE_QUOTE applies to COPY ... TO STDOUT only")
+		case "force_not_null", "force_null":
+			return CopyInOptions{}, forceNullOptionError(option.name)
+		case "force":
+			return CopyInOptions{}, errLegacyForceOption
 		default:
 			return CopyInOptions{}, fmt.Errorf("opengauss: COPY option %s is not implemented", strings.ToUpper(option.name))
 		}
 	}
 	return checkCopyInOptions(result)
 }
+
+// forceNullOptionError explains why the per-column NULL options are refused:
+// they change how a quoted or unquoted empty field reads, and the COPY protocol
+// reports no column names to apply them to.
+func forceNullOptionError(name string) error {
+	return fmt.Errorf("opengauss: COPY option %s is not implemented: it changes how an empty field reads, and the COPY protocol reports no column names to apply it to", strings.ToUpper(name))
+}
+
+// errLegacyForceOption reports the two-word FORCE QUOTE spelling that the
+// modern WITH (FORCE_QUOTE ...) form replaces.
+var errLegacyForceOption = errors.New("opengauss: the legacy FORCE QUOTE syntax is not supported: use WITH (FORCE_QUOTE ...)")
 
 // checkCopyInOptions fills the CSV defaults and rejects a combination the row
 // encoder cannot write.

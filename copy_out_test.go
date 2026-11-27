@@ -748,7 +748,23 @@ func TestParseCopyOutOptions(t *testing.T) {
 		{statement: "COPY t TO STDOUT BINARY", want: binaryCopyOutFormat()},
 		{statement: "COPY t TO STDOUT WITH (FORMAT xsv)", err: "unknown COPY format"},
 		{statement: "COPY t TO STDOUT WITH (FORMAT binary, HEADER)", err: "HEADER is available only with FORMAT csv"},
-		{statement: "COPY t TO STDOUT WITH (ENCODING 'UTF8')", err: "ENCODING is not implemented"},
+		// ENCODING is accepted only when it names the text the driver speaks.
+		{statement: "COPY t TO STDOUT WITH (ENCODING 'UTF8')", want: textCopyOutFormat()},
+		{statement: "COPY t TO STDOUT CSV ENCODING 'UTF8'", want: csvCopyOutFormat()},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, ENCODING 'utf-8')", want: csvCopyOutFormat()},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, ENCODING 'SQL_ASCII')", want: csvCopyOutFormat()},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, ENCODING 'GBK')", err: "ENCODING \"GBK\" is not implemented"},
+		// FORCE_QUOTE only adds quotes, so the CSV decoder accepts it as is.
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, FORCE_QUOTE *)", want: csvCopyOutFormat()},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, FORCE_QUOTE (a, \"b c\"))", want: csvCopyOutFormat()},
+		{statement: "COPY t TO STDOUT WITH (FORCE_QUOTE *)", err: "FORCE_QUOTE is available only with FORMAT csv"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, FORCE_QUOTE (a",
+			err: "the column list is not closed"},
+		// The per-column NULL options change how an empty field reads, and the
+		// COPY protocol carries no column names to apply them to.
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, FORCE_NOT_NULL (a))", err: "no column names"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, FORCE_NULL (a))", err: "no column names"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, FORCE QUOTE a)", err: "use WITH (FORCE_QUOTE ...)"},
 		{statement: "COPY t TO STDOUT WITH (HEADER)", err: "HEADER is available only with FORMAT csv"},
 		{statement: "COPY t TO STDOUT WITH (DELIMITER '|')", err: "DELIMITER is available only with FORMAT csv"},
 		{statement: "COPY t TO STDOUT WITH (FORMAT csv, DELIMITER '||')", err: "one single-byte character"},
