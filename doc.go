@@ -21,6 +21,14 @@
 // fallback_application_name), and options, taken from the options key or
 // PGOPTIONS. A parameter is omitted when its resolved value is empty.
 //
+// # Server version
+//
+// openGauss keeps a PostgreSQL-compatible server_version (9.2.4), so the product
+// release is read from the banner of SELECT version() instead. DetectServerVersion
+// runs that query once on a session taken with db.Conn and caches the parsed
+// product, major, minor and patch on the physical connection. It is refused
+// inside a transaction, where a failed probe would abort the caller's work.
+//
 // # Custom TLS
 //
 // RegisterTLSConfig associates a *tls.Config with a name that can be used as

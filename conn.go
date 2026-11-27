@@ -95,6 +95,12 @@ type conn struct {
 	// the driver treats as UTF-8.
 	encodingErr error
 
+	// version and versionKnown cache the parsed SELECT version() banner. The
+	// product release comes from the banner, not from the PostgreSQL-compatible
+	// server_version parameter.
+	version      ServerVersion
+	versionKnown bool
+
 	// An open COPY stream owns the session until CopyDone: copying records
 	// that state, copyOwner is the statement that may extend the stream,
 	// copyColumns is the row width from CopyInResponse, copyRowBuf is reused
