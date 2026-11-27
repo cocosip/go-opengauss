@@ -147,7 +147,10 @@ including TLS fallbacks and later targets.
   `ESCAPE` and `NULL`; a hand-written `COPY ... FROM STDIN` statement is read
   with the options it states. `COPY ... TO STDOUT` is read through
   `QueryContext` in text, CSV or binary, where a binary field is returned as the
-  raw `[]byte` the server wrote.
+  raw `[]byte` the server wrote. An `ENCODING` option is accepted when it names
+  UTF-8 or SQL_ASCII and refused otherwise, `FORCE_QUOTE` is accepted on output,
+  and the per-column `FORCE_NOT_NULL` and `FORCE_NULL` options are refused rather
+  than ignored.
 - `DetectServerVersion` reads the `SELECT version()` banner once per session and
   reports the product release. openGauss keeps a PostgreSQL-compatible
   `server_version`, so the banner is the value that identifies the build.
