@@ -58,6 +58,14 @@ var (
 // backpressure a slow consumer deserves.
 const listenerNotificationBuffer = 10
 
+// listenerIdlePing is how long the listening session may stay idle before the
+// driver sends an empty statement. The server hands pending notifications over
+// with the response to the session's next statement instead of waking an idle
+// client, so without this probe a notification would wait until the
+// application happened to run something on the listener. It is a variable so
+// tests can shorten or disable it.
+var listenerIdlePing = time.Second
+
 // Listener keeps one dedicated session open for LISTEN/NOTIFY. It owns that
 // connection outright and never takes one from a database/sql pool, because a
 // pooled session could be handed to unrelated statements. Commands run with
@@ -65,10 +73,15 @@ const listenerNotificationBuffer = 10
 // as soon as it returns and a NOTIFY is delivered when its statement commits.
 //
 // Notifications are delivered in the order the server sent them on the channel
-// returned by NotificationChannel. After a connection failure the listener
-// reconnects with exponential backoff, registers every previously accepted
-// channel again, and reports the lost interval through the EventCallback: the
-// server does not retain notifications for an absent session.
+// returned by NotificationChannel. An idle session is probed with an empty
+// statement once a second, because openGauss hands a published notification
+// over with the response to a session's next statement instead of waking an
+// idle client: without the probe a notification would wait until the
+// application happened to use the listener. After a connection failure the
+// listener reconnects with exponential backoff, registers every previously
+// accepted channel again, and reports the lost interval through the
+// EventCallback: the server does not retain notifications for an absent
+// session.
 type Listener struct {
 	config               *Config
 	callback             EventCallback
@@ -358,6 +371,9 @@ func (l *Listener) loop(current *conn) {
 	incoming, abort = startReader(current)
 	l.report(ListenerEventConnected, nil)
 
+	idle := time.NewTimer(listenerIdlePing)
+	defer idle.Stop()
+
 	for {
 		// Reconnect until a session is available again. While the session is
 		// down, statements fail instead of waiting for an unknown outage.
@@ -419,11 +435,33 @@ func (l *Listener) loop(current *conn) {
 			}
 		}
 
+		// The idle probe only runs while nothing else owns the session, and the
+		// timer measures the time spent waiting here.
+		if !idle.Stop() {
+			select {
+			case <-idle.C:
+			default:
+			}
+		}
+		idle.Reset(listenerIdlePing)
+		var idleC <-chan time.Time
+		if current != nil && flight == nil && len(queue) == 0 && len(resubscribe) == 0 && !resubscribed {
+			idleC = idle.C
+		}
+
 		select {
 		case <-l.closed:
 			return
 		case req := <-l.requests:
 			queue = append(queue, req)
+		case <-idleC:
+			// Prompt the server to hand over notifications it is holding
+			// back, without reporting anything to a caller.
+			flight = &listenerFlight{}
+			if err := sendSimpleQuery(current, ""); err != nil {
+				disconnect(err)
+				continue
+			}
 		case msg := <-incoming:
 			if msg.err != nil {
 				disconnect(msg.err)
@@ -492,7 +530,13 @@ func (l *Listener) loop(current *conn) {
 						delete(listened, flight.unregister)
 					}
 				}
-				flight.done <- err
+				if flight.done != nil {
+					flight.done <- err
+				} else if err != nil {
+					// The idle probe found a broken session.
+					disconnect(err)
+					continue
+				}
 				flight = nil
 			default:
 				disconnect(fmt.Errorf("opengauss: unexpected message type %q on a listener session", msg.typ))

@@ -42,10 +42,20 @@ func waitEvent(t *testing.T, events <-chan listenerEvent, want ListenerEvent) li
 	}
 }
 
+// parkIdleProbe disables the idle probe for a scripted session, whose peer only
+// expects the statements its test sends, and restores it afterwards.
+func parkIdleProbe(t *testing.T) {
+	t.Helper()
+	previous := listenerIdlePing
+	listenerIdlePing = time.Hour
+	t.Cleanup(func() { listenerIdlePing = previous })
+}
+
 // newTestListener opens a listener against the scripted peer with short
 // reconnect intervals and closes it when the test ends.
 func newTestListener(t *testing.T, dsn string, callback EventCallback) *Listener {
 	t.Helper()
+	parkIdleProbe(t)
 	listener, err := NewListenerWithCallback(dsn, callback, 10*time.Millisecond, 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("NewListener: %v", err)
@@ -272,6 +282,7 @@ func TestListenerCloseEndsSessionAndCommands(t *testing.T) {
 		s.expectType(proto.MsgTerminate)
 	})
 
+	parkIdleProbe(t)
 	listener, err := NewListener(testDSN(server, ""), 10*time.Millisecond, 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("NewListener: %v", err)
@@ -330,6 +341,7 @@ func TestListenerCommandsFailWhileReconnecting(t *testing.T) {
 	})
 
 	callback, events := recordEvents()
+	parkIdleProbe(t)
 	listener, err := NewListenerWithCallback(testDSN(server, ""), callback, 10*time.Second, 10*time.Second)
 	if err != nil {
 		t.Fatalf("NewListener: %v", err)
@@ -437,5 +449,63 @@ func TestListenerNextBackoffDoublesAndCaps(t *testing.T) {
 		if got := l.nextBackoff(tc.current); got != tc.want {
 			t.Errorf("nextBackoff(%v) = %v, want %v", tc.current, got, tc.want)
 		}
+	}
+}
+
+// TestListenerIdleProbeDeliversHeldNotifications proves the listener prompts the
+// server while idle: openGauss hands published notifications over with the
+// response to a session's next statement instead of waking an idle client.
+func TestListenerIdleProbeDeliversHeldNotifications(t *testing.T) {
+	previous := listenerIdlePing
+	listenerIdlePing = 20 * time.Millisecond
+	t.Cleanup(func() { listenerIdlePing = previous })
+
+	const channel = "idle_channel"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if got := s.expectSimpleQuery(); got != "LISTEN \""+channel+"\"" {
+			s.fail("query = %q, want the LISTEN", got)
+			return
+		}
+		s.sendCommandComplete("LISTEN")
+		s.sendReady(proto.TxnIdle)
+
+		held := false
+		for {
+			typ, body := s.readMessage()
+			switch typ {
+			case 0:
+				return
+			case proto.MsgTerminate:
+				return
+			case proto.MsgQuery:
+				if query := strings.TrimSuffix(string(body), "\x00"); query != "" {
+					s.fail("unexpected query %q", query)
+					return
+				}
+				if !held {
+					held = true
+					s.writeRaw(notificationFrame(4321, channel, "held"))
+				}
+				s.sendEmptyQueryResponse()
+				s.sendReady(proto.TxnIdle)
+			default:
+				s.fail("unexpected client message %q", typ)
+				return
+			}
+		}
+	})
+
+	listener, err := NewListener(testDSN(server, ""), 10*time.Millisecond, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewListener: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if err := listener.Listen(channel); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	notification := receiveNotification(t, listener)
+	if notification.PID != 4321 || notification.Channel != channel || notification.Extra != "held" {
+		t.Fatalf("notification = %+v, want the held payload", notification)
 	}
 }
