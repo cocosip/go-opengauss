@@ -257,17 +257,10 @@ func copyInTailError(statement string, clauseEnd int) error {
 		"opengauss: COPY ... FROM STDIN options are not implemented: the driver writes the default text format only")
 }
 
-// copyOutTailError rejects COPY options, because the row decoder always reads
-// the default text format. A CSV stream would be split under different rules
-// and silently produce wrong values.
-func copyOutTailError(statement string, clauseEnd int) error {
-	return copyTailError(statement, clauseEnd,
-		"opengauss: COPY ... TO STDOUT options are not implemented: the driver reads the default text format only")
-}
-
-// copyTailError rejects COPY options, because only the default text format is
-// implemented. Whitespace, comments and a trailing separator may follow the
-// clause; anything else is an option the driver does not implement.
+// copyTailError rejects COPY input options, because only the default text format
+// is implemented for that direction. Whitespace, comments and a trailing
+// separator may follow the clause; anything else is an option the driver does
+// not implement.
 func copyTailError(statement string, clauseEnd int, message string) error {
 	for i := clauseEnd; i < len(statement); {
 		switch {

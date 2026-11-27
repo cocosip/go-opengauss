@@ -51,6 +51,8 @@ func FuzzCopyDirection(f *testing.F) {
 	f.Add("COPY t FROM STDIN")
 	f.Add("COPY t (a, b) FROM STDIN WITH (FORMAT csv)")
 	f.Add("COPY t TO STDOUT")
+	f.Add("COPY t TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER '|', NULL 'NA')")
+	f.Add("COPY t TO STDOUT CSV HEADER QUOTE '''' ESCAPE '\\'")
 	f.Add("COPY (SELECT 'COPY x FROM STDIN') TO STDOUT")
 	f.Add("SELECT 'COPY t FROM STDIN'")
 	f.Add("-- COPY t FROM STDIN\nSELECT 1")
@@ -66,7 +68,7 @@ func FuzzCopyDirection(f *testing.F) {
 		}
 		if kind != copyNone {
 			_ = copyInTailError(statement, clauseEnd)
-			_ = copyOutTailError(statement, clauseEnd)
+			_, _ = parseCopyOutOptions(statement, clauseEnd)
 		}
 	})
 }

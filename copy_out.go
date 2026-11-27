@@ -21,15 +21,17 @@ var maxCopyOutRow = 64 << 20
 // copyOutRows streams the rows of a COPY ... TO STDOUT statement read through
 // QueryContext. The COPY protocol carries no column names or type OIDs, so the
 // columns are reported as column1..columnN and every value is a string (NULL is
-// nil): the text format cannot say more. The session stays pinned to the
-// statement until the rows reach ReadyForQuery or are closed.
+// nil): neither the text nor the CSV format can say more. The session stays
+// pinned to the statement until the rows reach ReadyForQuery or are closed.
 type copyOutRows struct {
-	conn    *conn
-	columns int
-	ctx     context.Context
-	watcher *cancelWatcher
-	pending []byte
-	done    bool
+	conn       *conn
+	columns    int
+	format     copyOutFormat
+	headerDone bool
+	ctx        context.Context
+	watcher    *cancelWatcher
+	pending    []byte
+	done       bool
 }
 
 func (r *copyOutRows) Columns() []string {
@@ -46,15 +48,30 @@ func (r *copyOutRows) ColumnTypeScanType(int) reflect.Type {
 	return reflect.TypeOf("")
 }
 
-// Next reads one text row. Rows may be split across CopyData messages, so an
-// incomplete line is buffered until its terminator arrives.
+// Next reads one row. Rows may be split across CopyData messages, so an
+// incomplete row is buffered until its terminator arrives; in CSV, a newline
+// inside a quoted field belongs to the row and does not end it.
 func (r *copyOutRows) Next(dest []driver.Value) error {
 	if r.done {
 		return io.EOF
 	}
 	for {
-		if line, ok := r.takeLine(); ok {
-			if err := r.decodeRow(line, dest); err != nil {
+		fields, ok, err := r.takeRow()
+		if err != nil {
+			r.done = true
+			r.pending = nil
+			if stopErr := r.abort(); stopErr != nil {
+				r.conn.bad = true
+				return errors.Join(err, stopErr)
+			}
+			return err
+		}
+		if ok {
+			if r.format.header && !r.headerDone {
+				r.headerDone = true
+				continue
+			}
+			if err := r.decodeRow(fields, dest); err != nil {
 				r.done = true
 				r.pending = nil
 				if stopErr := r.abort(); stopErr != nil {
@@ -80,8 +97,8 @@ func (r *copyOutRows) Next(dest []driver.Value) error {
 		case proto.MsgCopyData:
 			r.pending = append(r.pending, body...)
 			// The cap applies to one row, so a frame that carries several
-			// complete rows may exceed it; only an unterminated run is too big.
-			if len(r.pending) > maxCopyOutRow && bytes.IndexByte(r.pending, '\n') < 0 {
+			// complete rows may exceed it; only an unterminated row is too big.
+			if len(r.pending) > maxCopyOutRow && !r.hasCompleteRow() {
 				r.done = true
 				r.pending = nil
 				err := fmt.Errorf("opengauss: a COPY ... TO STDOUT row exceeds %d bytes", maxCopyOutRow)
@@ -188,40 +205,181 @@ func (r *copyOutRows) abort() error {
 	return err
 }
 
-// takeLine removes one complete row from the buffer. The row terminator is not
-// part of the returned line.
-func (r *copyOutRows) takeLine() ([]byte, bool) {
-	index := bytes.IndexByte(r.pending, '\n')
-	if index < 0 {
-		return nil, false
-	}
-	line := r.pending[:index]
-	if index+1 == len(r.pending) {
-		r.pending = nil
-	} else {
-		r.pending = r.pending[index+1:]
-	}
-	return line, true
+// copyField is one decoded field: either NULL or its text.
+type copyField struct {
+	value []byte
+	null  bool
 }
 
-// decodeRow splits one text row into fields and expands the COPY escapes. A
-// field that is exactly \N is NULL; any other field is text.
-func (r *copyOutRows) decodeRow(line []byte, dest []driver.Value) error {
+// takeRow removes one complete row from the buffer and returns its fields.
+func (r *copyOutRows) takeRow() ([]copyField, bool, error) {
+	fields, consumed, ok, err := parseCopyOutRow(r.pending, r.format)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	r.pending = r.pending[consumed:]
+	if len(r.pending) == 0 {
+		r.pending = nil
+	}
+	return fields, true, nil
+}
+
+// hasCompleteRow reports whether the buffer already holds one whole row, which
+// keeps the row cap from rejecting a frame that carries several complete rows.
+func (r *copyOutRows) hasCompleteRow() bool {
+	if !r.format.csv {
+		return bytes.IndexByte(r.pending, '\n') >= 0
+	}
+	_, _, ok, _ := parseCopyOutRow(r.pending, r.format)
+	return ok
+}
+
+// decodeRow writes one row's fields into dest: a NULL field is nil and every
+// other field is the decoded text.
+func (r *copyOutRows) decodeRow(fields []copyField, dest []driver.Value) error {
 	if len(dest) != r.columns {
 		return fmt.Errorf("opengauss: a COPY ... TO STDOUT row has %d columns but the destination has %d", r.columns, len(dest))
 	}
-	fields := bytes.Split(line, []byte{'\t'})
 	if len(fields) != r.columns {
 		return fmt.Errorf("opengauss: a COPY ... TO STDOUT row has %d fields but the stream announced %d columns", len(fields), r.columns)
 	}
 	for i, field := range fields {
-		if len(field) == 2 && field[0] == '\\' && field[1] == 'N' {
+		if field.null {
 			dest[i] = nil
 			continue
 		}
-		dest[i] = string(decodeCopyField(field))
+		dest[i] = string(field.value)
 	}
 	return nil
+}
+
+// parseCopyOutRow parses one row in the statement's format. It reports false
+// when the buffer does not hold a whole row yet, and an error when the buffered
+// rows cannot be read in that format.
+func parseCopyOutRow(buf []byte, format copyOutFormat) ([]copyField, int, bool, error) {
+	if format.csv {
+		return parseCSVRow(buf, format)
+	}
+	return parseTextRow(buf, format)
+}
+
+// parseTextRow reads one row of the default text format and expands the COPY
+// escapes. A field that is exactly \N is NULL; any other field is text.
+func parseTextRow(buf []byte, format copyOutFormat) ([]copyField, int, bool, error) {
+	index := bytes.IndexByte(buf, '\n')
+	if index < 0 {
+		return nil, 0, false, nil
+	}
+	raw := bytes.Split(buf[:index], []byte{format.delimiter})
+	fields := make([]copyField, len(raw))
+	for i, field := range raw {
+		if bytes.Equal(field, format.null) {
+			fields[i] = copyField{null: true}
+			continue
+		}
+		fields[i] = copyField{value: decodeCopyField(field)}
+	}
+	return fields, index + 1, true, nil
+}
+
+// parseCSVRow reads one CSV row: a quoted field may hold the separator, the row
+// terminator and a doubled quote, while an unquoted field equal to the NULL
+// string is NULL.
+func parseCSVRow(buf []byte, format copyOutFormat) ([]copyField, int, bool, error) {
+	var fields []copyField
+	i := 0
+	for {
+		if i >= len(buf) {
+			return nil, 0, false, nil
+		}
+		field := copyField{}
+		if buf[i] == format.quote {
+			value, end, ok, err := parseQuotedCSVField(buf, i, format)
+			if err != nil || !ok {
+				return nil, 0, false, err
+			}
+			field.value, i = value, end
+		} else {
+			start := i
+			for i < len(buf) && buf[i] != format.delimiter && buf[i] != '\n' && buf[i] != '\r' {
+				i++
+			}
+			if i >= len(buf) {
+				return nil, 0, false, nil
+			}
+			raw := buf[start:i]
+			if bytes.Equal(raw, format.null) {
+				field.null = true
+			} else {
+				field.value = append([]byte(nil), raw...)
+			}
+		}
+		fields = append(fields, field)
+		if i >= len(buf) {
+			return nil, 0, false, nil
+		}
+		switch buf[i] {
+		case format.delimiter:
+			i++
+		case '\n':
+			return fields, i + 1, true, nil
+		case '\r':
+			if i+1 >= len(buf) {
+				return nil, 0, false, nil
+			}
+			if buf[i+1] != '\n' {
+				return nil, 0, false, errors.New("opengauss: a COPY ... TO STDOUT CSV row has a stray carriage return")
+			}
+			return fields, i + 2, true, nil
+		default:
+			return nil, 0, false, fmt.Errorf("opengauss: a COPY ... TO STDOUT CSV row has %q after a quoted field", buf[i])
+		}
+	}
+}
+
+// parseQuotedCSVField reads one quoted CSV field. The quote character doubles to
+// stand for itself by default; a distinct ESCAPE character escapes the quote
+// and itself, and any other character follows it unchanged.
+func parseQuotedCSVField(buf []byte, start int, format copyOutFormat) ([]byte, int, bool, error) {
+	var value []byte
+	i := start + 1
+	for {
+		if i >= len(buf) {
+			return nil, 0, false, nil
+		}
+		c := buf[i]
+		if c == format.escape && format.escape != format.quote {
+			if i+1 >= len(buf) {
+				return nil, 0, false, nil
+			}
+			next := buf[i+1]
+			if next == format.quote || next == format.escape {
+				value = append(value, next)
+				i += 2
+				continue
+			}
+			value = append(value, c)
+			i++
+			continue
+		}
+		if c == format.quote {
+			if format.escape == format.quote {
+				if i+1 >= len(buf) {
+					// A quote at the end of the buffer may be the first half of
+					// a doubled quote, so the row is not complete yet.
+					return nil, 0, false, nil
+				}
+				if buf[i+1] == format.quote {
+					value = append(value, format.quote)
+					i += 2
+					continue
+				}
+			}
+			return value, i + 1, true, nil
+		}
+		value = append(value, c)
+		i++
+	}
 }
 
 // decodeCopyField expands the escapes of the COPY text format. The server emits
@@ -295,8 +453,10 @@ func hexDigit(c byte) (int, bool) {
 }
 
 // queryCopyOut sends a COPY ... TO STDOUT statement and waits for the server's
-// CopyOutResponse. The returned rows own the session until they finish.
-func (c *conn) queryCopyOut(ctx context.Context, statement string) (driver.Rows, error) {
+// CopyOutResponse. The returned rows own the session until they finish, and
+// format is the representation its CopyData rows carry, as the statement's
+// options requested.
+func (c *conn) queryCopyOut(ctx context.Context, statement string, format copyOutFormat) (driver.Rows, error) {
 	watcher, err := c.beginOperation(ctx)
 	if err != nil {
 		return nil, err
@@ -315,13 +475,13 @@ func (c *conn) queryCopyOut(ctx context.Context, statement string) (driver.Rows,
 		}
 		switch typ {
 		case proto.MsgCopyOutResponse:
-			format, columns, err := parseCopyResponse(body)
+			streamFormat, columns, err := parseCopyResponse(body)
 			if err != nil {
 				c.bad = true
 				c.endOperation(watcher)
 				return nil, err
 			}
-			if format != 0 {
+			if streamFormat != 0 {
 				// A binary stream cannot be decoded here. Copy-out mode cannot
 				// be ended from the frontend, so a cancel request stops the
 				// server before the remaining data is discarded.
@@ -331,14 +491,14 @@ func (c *conn) queryCopyOut(ctx context.Context, statement string) (driver.Rows,
 				if stopErr := c.abortCopyOut(); stopErr != nil {
 					return nil, c.wrapIOError(ctx, "copy out", stopErr)
 				}
-				return nil, errors.New("opengauss: COPY ... TO STDOUT uses binary format, which this driver does not support; request the default text format")
+				return nil, errCopyOutBinary
 			}
 			c.copying = true
 			c.copyOwner = nil
 			c.copyColumns = columns
 			c.copyWatcher = watcher
 			c.copyCtx = ctx
-			return &copyOutRows{conn: c, columns: columns, ctx: ctx, watcher: watcher}, nil
+			return &copyOutRows{conn: c, columns: columns, format: format, ctx: ctx, watcher: watcher}, nil
 		case proto.MsgErrorResponse:
 			serverErr := parseErrorResponse(body)
 			drainErr := c.drainUntilReady()

@@ -687,23 +687,337 @@ func TestDecodeCopyField(t *testing.T) {
 	}
 }
 
-func TestCopyOutTailError(t *testing.T) {
-	withOptions := "COPY demotable TO STDOUT WITH (FORMAT csv)"
-	if kind, clauseEnd := copyDirection(withOptions); kind != copyOut {
-		t.Fatalf("copyDirection = %v, want copyOut", kind)
-	} else if err := copyOutTailError(withOptions, clauseEnd); err == nil {
-		t.Fatal("a CSV option was accepted")
+func TestParseCopyOutOptions(t *testing.T) {
+	tests := []struct {
+		statement string
+		want      copyOutFormat
+		err       string
+	}{
+		{statement: "COPY t TO STDOUT", want: textCopyOutFormat()},
+		{statement: "COPY t TO STDOUT;", want: textCopyOutFormat()},
+		{statement: "COPY t TO STDOUT -- note\n", want: textCopyOutFormat()},
+		{statement: "COPY t TO/**/STDOUT /* note */", want: textCopyOutFormat()},
+		{statement: "COPY t TO STDOUT WITH (FORMAT text)", want: textCopyOutFormat()},
+		{statement: "COPY t TO STDOUT CSV", want: csvCopyOutFormat()},
+		{statement: "COPY t TO STDOUT WITH CSV", want: csvCopyOutFormat()},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, HEADER)", want: csvCopyOutFormat(true)},
+		{statement: "COPY t TO STDOUT CSV HEADER", want: csvCopyOutFormat(true)},
+		{statement: "COPY t TO STDOUT WITH CSV HEADER", want: csvCopyOutFormat(true)},
+		{statement: "COPY t TO STDOUT WITH (HEADER false, FORMAT csv)", want: csvCopyOutFormat()},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, DELIMITER '|', QUOTE '''', ESCAPE '\\', NULL 'NA')",
+			want: modifiedCSVCopyOutFormat('|', '\'', '\\', "NA")},
+		// ESCAPE defaults to the quote character the statement selected.
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, QUOTE '~')",
+			want: modifiedCSVCopyOutFormat(',', '~', '~', "")},
+		{statement: "COPY t TO STDOUT WITH (FORMAT binary)", err: "binary format"},
+		{statement: "COPY t TO STDOUT BINARY", err: "binary format"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT xsv)", err: "unknown COPY format"},
+		{statement: "COPY t TO STDOUT WITH (ENCODING 'UTF8')", err: "ENCODING is not implemented"},
+		{statement: "COPY t TO STDOUT WITH (HEADER)", err: "HEADER is available only with FORMAT csv"},
+		{statement: "COPY t TO STDOUT WITH (DELIMITER '|')", err: "DELIMITER is available only with FORMAT csv"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, DELIMITER '||')", err: "one single-byte character"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, HEADER maybe)", err: "is not a boolean"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv, HEADER); SELECT 1", err: "only statement"},
+		{statement: "COPY t TO STDOUT WITH (FORMAT csv", err: "not closed"},
 	}
-	plain := "COPY (SELECT 'TO STDOUT') TO STDOUT"
-	if kind, clauseEnd := copyDirection(plain); kind != copyOut {
-		t.Fatalf("copyDirection = %v, want copyOut", kind)
-	} else if err := copyOutTailError(plain, clauseEnd); err != nil {
-		t.Fatalf("a default-format statement was rejected: %v", err)
+	for _, test := range tests {
+		kind, clauseEnd := copyDirection(test.statement)
+		if kind != copyOut {
+			t.Fatalf("copyDirection(%q) = %v, want copyOut", test.statement, kind)
+		}
+		format, err := parseCopyOutOptions(test.statement, clauseEnd)
+		if test.err != "" {
+			if err == nil || !strings.Contains(err.Error(), test.err) {
+				t.Errorf("parseCopyOutOptions(%q) error = %v, want %q", test.statement, err, test.err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseCopyOutOptions(%q) = %v", test.statement, err)
+			continue
+		}
+		if !reflect.DeepEqual(format, test.want) {
+			t.Errorf("parseCopyOutOptions(%q) = %#v, want %#v", test.statement, format, test.want)
+		}
 	}
-	commented := "COPY demotable TO/**/STDOUT -- note\n"
-	if kind, clauseEnd := copyDirection(commented); kind != copyOut {
-		t.Fatalf("copyDirection = %v, want copyOut", kind)
-	} else if err := copyOutTailError(commented, clauseEnd); err != nil {
-		t.Fatalf("a trailing comment was rejected: %v", err)
+}
+
+// csvCopyOutFormat is the expected format of a CSV statement, optionally with
+// its header line skipped.
+func csvCopyOutFormat(header ...bool) copyOutFormat {
+	format := textCopyOutFormat()
+	format.useCSVDefaults()
+	if len(header) > 0 {
+		format.header = header[0]
+	}
+	return format
+}
+
+// modifiedCSVCopyOutFormat is a CSV format whose separators the statement set.
+func modifiedCSVCopyOutFormat(delimiter, quote, escape byte, null string) copyOutFormat {
+	format := csvCopyOutFormat()
+	format.delimiter = delimiter
+	format.quote = quote
+	format.escape = escape
+	if null != "" {
+		format.null = []byte(null)
+	}
+	return format
+}
+
+// TestCopyOutCSVStreamsRows proves the CSV decoder handles a quoted separator,
+// a newline inside a quoted field, a doubled quote, NULL and an empty string,
+// with the header line skipped and the payload split across frames.
+func TestCopyOutCSVStreamsRows(t *testing.T) {
+	const query = "COPY demotable TO STDOUT WITH (FORMAT csv, HEADER)"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if got := s.expectSimpleQuery(); got != query {
+			s.fail("query = %q, want %q", got, query)
+			return
+		}
+		s.sendCopyOutResponse(0, 4)
+		// The header row and the quoted field of the first row are split
+		// across frames, and the newline inside the quotes does not end it.
+		s.sendCopyData("id,name,note,extra\n1,\"a,b\",\"line1\n")
+		s.sendCopyData("line2\",\"say \"\"hi\"\"\"\n2,,\"\",x\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 2")
+		s.sendReady(proto.TxnIdle)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	rows, err := db.QueryContext(testContext(t), query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var got [][]any
+	for rows.Next() {
+		var a, b, c, d any
+		if err := rows.Scan(&a, &b, &c, &d); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got = append(got, []any{a, b, c, d})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	want := [][]any{
+		{"1", "a,b", "line1\nline2", `say "hi"`},
+		{"2", nil, "", "x"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows = %#v, want %#v", got, want)
+	}
+}
+
+// TestCopyOutCSVLegacySyntax reads a header line through the legacy CSV HEADER
+// form of the statement.
+func TestCopyOutCSVLegacySyntax(t *testing.T) {
+	const query = "COPY demotable TO STDOUT CSV HEADER"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if got := s.expectSimpleQuery(); got != query {
+			s.fail("query = %q, want %q", got, query)
+			return
+		}
+		s.sendCopyOutResponse(0, 2)
+		s.sendCopyData("id,value\n1,\"2\"\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 1")
+		s.sendReady(proto.TxnIdle)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	rows, err := db.QueryContext(testContext(t), query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		t.Fatalf("Next = false, err = %v", rows.Err())
+	}
+	var id, value string
+	if err := rows.Scan(&id, &value); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if id != "1" || value != "2" {
+		t.Fatalf("row = %q %q, want 1 2", id, value)
+	}
+	if rows.Next() {
+		t.Fatal("an extra row was returned")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+}
+
+// TestCopyOutCSVCustomSeparators decodes a CSV stream whose separator, quote and
+// NULL string the statement chose.
+func TestCopyOutCSVCustomSeparators(t *testing.T) {
+	const query = "COPY demotable TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER '|', NULL 'NA', QUOTE '~')"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if got := s.expectSimpleQuery(); got != query {
+			s.fail("query = %q, want %q", got, query)
+			return
+		}
+		s.sendCopyOutResponse(0, 2)
+		s.sendCopyData("id|value\n1|NA\n2|~a|b~\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 2")
+		s.sendReady(proto.TxnIdle)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	rows, err := db.QueryContext(testContext(t), query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var got [][]any
+	for rows.Next() {
+		var id, value any
+		if err := rows.Scan(&id, &value); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got = append(got, []any{id, value})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	want := [][]any{{"1", nil}, {"2", "a|b"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows = %#v, want %#v", got, want)
+	}
+}
+
+// TestCopyOutCSVUnterminatedRowStopsStream proves a stream that ends inside a
+// quoted field is reported instead of returning a half row.
+func TestCopyOutCSVUnterminatedRowStopsStream(t *testing.T) {
+	const query = "COPY demotable TO STDOUT WITH (FORMAT csv)"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 2)
+		s.sendCopyData("1,\"open\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 0")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		t.Fatal("a half row was returned")
+	}
+	if err := rows.Err(); err == nil || !strings.Contains(err.Error(), "middle of a row") {
+		t.Fatalf("Rows.Err = %v, want the truncated-row error", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+// TestCopyOutCSVMalformedRowStopsStream proves a row the CSV rules cannot read
+// stops the stream and leaves the session reusable.
+func TestCopyOutCSVMalformedRowStopsStream(t *testing.T) {
+	const query = "COPY demotable TO STDOUT WITH (FORMAT csv)"
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 2)
+		s.sendCopyData("\"a\"x,b\n")
+		s.sendCopyDone()
+		s.sendCommandComplete("COPY 0")
+		s.sendReady(proto.TxnIdle)
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		t.Fatal("a malformed row was accepted")
+	}
+	if err := rows.Err(); err == nil || !strings.Contains(err.Error(), "CSV row") {
+		t.Fatalf("Rows.Err = %v, want a CSV decoding error", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+// TestCopyOutCSVRowsAcrossManyFrames cuts CSV rows, quoted newlines and doubled
+// quotes at arbitrary frame boundaries.
+func TestCopyOutCSVRowsAcrossManyFrames(t *testing.T) {
+	const (
+		query = "COPY demotable TO STDOUT WITH (FORMAT csv)"
+		total = 200
+	)
+	var payload strings.Builder
+	for i := 0; i < total; i++ {
+		fmt.Fprintf(&payload, "%d,\"value, %d\"\n", i, i)
+	}
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCopyOutResponse(0, 2)
+		chunk := payload.String()
+		for len(chunk) > 0 {
+			size := 5
+			if size > len(chunk) {
+				size = len(chunk)
+			}
+			s.sendCopyData(chunk[:size])
+			chunk = chunk[size:]
+		}
+		s.sendCopyDone()
+		s.sendCommandComplete(fmt.Sprintf("COPY %d", total))
+		s.sendReady(proto.TxnIdle)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	rows, err := db.QueryContext(testContext(t), query)
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	count := 0
+	for rows.Next() {
+		var id, value string
+		if err := rows.Scan(&id, &value); err != nil {
+			t.Fatalf("Scan row %d: %v", count, err)
+		}
+		if want := fmt.Sprintf("%d", count); id != want {
+			t.Fatalf("row %d id = %q, want %q", count, id, want)
+		}
+		if want := fmt.Sprintf("value, %d", count); value != want {
+			t.Fatalf("row %d value = %q, want %q", count, value, want)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	if count != total {
+		t.Fatalf("rows = %d, want %d", count, total)
 	}
 }

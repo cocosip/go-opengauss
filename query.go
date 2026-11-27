@@ -49,10 +49,11 @@ func (c *conn) QueryContext(ctx context.Context, statement string, args []driver
 		if len(args) > 0 {
 			return nil, errCopyOutParameters
 		}
-		if err := copyOutTailError(statement, clauseEnd); err != nil {
+		format, err := parseCopyOutOptions(statement, clauseEnd)
+		if err != nil {
 			return nil, err
 		}
-		return c.queryCopyOut(ctx, statement)
+		return c.queryCopyOut(ctx, statement, format)
 	}
 	frames, err := queryFrames(statement, args)
 	if err != nil {

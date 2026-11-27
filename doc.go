@@ -89,9 +89,15 @@
 // # Session-scoped helpers
 //
 // CopyIn streams rows into a table inside a transaction with COPY ... FROM
-// STDIN, using the default text format. The inverse direction is read through
-// QueryContext: a COPY ... TO STDOUT statement returns rows whose columns are
-// reported as column1..columnN and whose values are strings, with NULL as nil.
+// STDIN, using the default text format; a FROM STDIN option such as CSV or
+// HEADER is refused. The inverse direction is read through QueryContext: a
+// COPY ... TO STDOUT statement returns rows whose columns are reported as
+// column1..columnN and whose values are strings, with NULL as nil. The default
+// text format and CSV are decoded: FORMAT csv is supported with the HEADER,
+// DELIMITER, QUOTE, ESCAPE and NULL options, in the WITH (...) form and in the
+// legacy bare form. An option the decoder cannot honour, such as FORMAT binary
+// or ENCODING, is refused when the statement is issued rather than read under
+// the wrong rules.
 //
 // NewListener keeps one dedicated session for LISTEN/NOTIFY and reconnects it
 // after a failure, re-registering the channels it had accepted. It is separate
