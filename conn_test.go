@@ -2063,8 +2063,19 @@ func TestUnmappedTypesStayText(t *testing.T) {
 	if name := types[3].DatabaseTypeName(); name != "jsonb" {
 		t.Errorf("DatabaseTypeName(jsonb) = %q", name)
 	}
-	if name := types[0].DatabaseTypeName(); name != "" {
-		t.Errorf("DatabaseTypeName(array) = %q, want no name for an OID outside the table", name)
+	// An array is named after its element, while a user-defined type outside
+	// the table keeps the empty name that says the driver does not know it.
+	if name := types[0].DatabaseTypeName(); name != "int4[]" {
+		t.Errorf("DatabaseTypeName(array) = %q, want int4[]", name)
+	}
+	if name := types[1].DatabaseTypeName(); name != "text[]" {
+		t.Errorf("DatabaseTypeName(text array) = %q, want text[]", name)
+	}
+	if name := types[4].DatabaseTypeName(); name != "" {
+		t.Errorf("DatabaseTypeName(enum) = %q, want no name for an OID outside the table", name)
+	}
+	if name := types[5].DatabaseTypeName(); name != "" {
+		t.Errorf("DatabaseTypeName(domain) = %q, want no name for an OID outside the table", name)
 	}
 	if name := types[6].DatabaseTypeName(); name != "raw" {
 		t.Errorf("DatabaseTypeName(raw) = %q", name)

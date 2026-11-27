@@ -224,3 +224,62 @@ func TestDecodeDoesNotAliasInput(t *testing.T) {
 		t.Errorf("Decode aliased the input buffer: %v", decoded)
 	}
 }
+
+// TestTypeNameArrays covers the array and vector names, whose OIDs the server's
+// catalog defines and which a caller reads through ColumnTypes.
+func TestTypeNameArrays(t *testing.T) {
+	tests := []struct {
+		oid  int32
+		want string
+	}{
+		{1000, "bool[]"},
+		{1007, "int4[]"},
+		{1009, "text[]"},
+		{1231, "numeric[]"},
+		{2951, "uuid[]"},
+		{3201, "blob[]"},
+		{3968, "nvarchar2[]"},
+		{8308, "vector[]"},
+		{Vector, "vector"},
+		{Halfvec, "halfvec"},
+		{Sparsevec, "sparsevec"},
+		{86, "raw"},
+		{999999, ""},
+	}
+	for _, tc := range tests {
+		if got := TypeName(tc.oid); got != tc.want {
+			t.Errorf("TypeName(%d) = %q, want %q", tc.oid, got, tc.want)
+		}
+	}
+}
+
+// TestArrayOIDsDoNotCollide keeps the array table from shadowing a scalar name or
+// repeating an OID, which would mislabel a column.
+func TestArrayOIDsDoNotCollide(t *testing.T) {
+	seen := make(map[int32]string, len(arrayTypeNames))
+	for arrayOID, element := range arrayTypeNames {
+		if existing, ok := typeNames[arrayOID]; ok {
+			t.Errorf("array OID %d is also the scalar %q", arrayOID, existing)
+		}
+		if previous, ok := seen[arrayOID]; ok {
+			t.Errorf("array OID %d appears twice: %q and %q", arrayOID, previous, element)
+		}
+		seen[arrayOID] = element
+		if _, ok := typeNames[elementOID(t, element)]; !ok {
+			t.Errorf("array OID %d names element %q, which has no scalar entry", arrayOID, element)
+		}
+	}
+}
+
+// elementOID returns the OID of a scalar type name, failing the test when the
+// name is not in the table.
+func elementOID(t *testing.T, name string) int32 {
+	t.Helper()
+	for typeOID, candidate := range typeNames {
+		if candidate == name {
+			return typeOID
+		}
+	}
+	t.Fatalf("no scalar type is named %q", name)
+	return 0
+}

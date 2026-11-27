@@ -42,6 +42,14 @@ const (
 	UUID        int32 = 2950
 	JSONB       int32 = 3802
 	Nvarchar2   int32 = 3969
+	Record      int32 = 2249
+
+	// Vector is the native kernel vector type of a 7.x server. A 6.x server
+	// provides the dataVec extension types with other OIDs, which stay unknown
+	// here and are therefore reported without a name.
+	Vector    int32 = 8305
+	Halfvec   int32 = 8306
+	Sparsevec int32 = 8307
 )
 
 var typeNames = map[int32]string{
@@ -72,11 +80,60 @@ var typeNames = map[int32]string{
 	UUID:        "uuid",
 	JSONB:       "jsonb",
 	Nvarchar2:   "nvarchar2",
+	Record:      "record",
+	Vector:      "vector",
+	Halfvec:     "halfvec",
+	Sparsevec:   "sparsevec",
+}
+
+// arrayTypeNames maps the OID of an array type to the name of its element type.
+// The array OIDs are not derivable from the element OID, so each one is listed;
+// they are the values a 7.0 server reports in pg_type.
+var arrayTypeNames = map[int32]string{
+	87:   "raw",
+	199:  "json",
+	1000: "bool",
+	1001: "bytea",
+	1002: "char",
+	1003: "name",
+	1005: "int2",
+	1007: "int4",
+	1009: "text",
+	1014: "bpchar",
+	1015: "varchar",
+	1016: "int8",
+	1021: "float4",
+	1022: "float8",
+	1028: "oid",
+	1115: "timestamp",
+	1182: "date",
+	1185: "timestamptz",
+	1187: "interval",
+	1231: "numeric",
+	1270: "timetz",
+	1561: "bit",
+	1563: "varbit",
+	2287: "record",
+	2951: "uuid",
+	3201: "blob",
+	3807: "jsonb",
+	3968: "nvarchar2",
+	8308: "vector",
+	8309: "halfvec",
+	8310: "sparsevec",
 }
 
 // TypeName returns the openGauss name of a type OID, or "" when it is unknown.
+// An array type is named after its element type, as the server's own catalog
+// does, for example int4[].
 func TypeName(typeOID int32) string {
-	return typeNames[typeOID]
+	if name, ok := typeNames[typeOID]; ok {
+		return name
+	}
+	if element, ok := arrayTypeNames[typeOID]; ok {
+		return element + "[]"
+	}
+	return ""
 }
 
 // ScanType returns the Go type that Decode produces for a type OID. Unknown
