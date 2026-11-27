@@ -143,7 +143,11 @@ including TLS fallbacks and later targets.
   exact server text. `ColumnTypes` reports declared lengths and numeric
   precision/scale when the server sends a type modifier.
 - `CopyIn` streams text rows with `COPY ... FROM STDIN`; `COPY ... TO STDOUT`
-  is read through `QueryContext`.
+  is read through `QueryContext` in the default text format or in CSV, including
+  `HEADER`, `DELIMITER`, `QUOTE`, `ESCAPE` and `NULL`.
+- `DetectServerVersion` reads the `SELECT version()` banner once per session and
+  reports the product release. openGauss keeps a PostgreSQL-compatible
+  `server_version`, so the banner is the value that identifies the build.
 - `NewListener` keeps a dedicated LISTEN/NOTIFY session and reconnects with
   backoff.
 - `ExecuteMultiSearch` runs a vector query per argument set on pinned sessions
