@@ -61,6 +61,17 @@ func TestLiveFirstMilestone(t *testing.T) {
 	}
 	defer func() { _ = pinned.Close() }()
 
+	// The banner is the only product signal: openGauss reports a
+	// PostgreSQL-compatible server_version.
+	detected, err := DetectServerVersion(ctx, pinned)
+	if err != nil {
+		t.Fatalf("DetectServerVersion: %v", err)
+	}
+	t.Logf("product version: %s", detected)
+	if detected.Product == "" || detected.Major == 0 {
+		t.Errorf("the banner %q did not name a product and version", detected.Raw)
+	}
+
 	if _, err := pinned.ExecContext(ctx, "CREATE TEMPORARY TABLE opengauss_milestone (v integer)"); err != nil {
 		t.Fatalf("CREATE TEMPORARY TABLE: %v", err)
 	}
