@@ -1,6 +1,7 @@
 package opengauss
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -15,15 +16,29 @@ import (
 // CopyIn starts a text COPY ... FROM STDIN stream into table. It must be called
 // on a transaction, because the whole stream and its result share one session.
 // Call Exec once per row and then Close, which finishes the stream and reads
-// the server's result. A row is written in the text COPY format: values are
-// converted like other parameters, NULL becomes \N, and tabs, newlines,
-// carriage returns and backslashes are escaped. Options after FROM STDIN such
-// as CSV or HEADER are rejected: only the default text format is implemented.
+// the server's result. A row is written in the default text COPY format: values
+// are converted like other parameters, NULL becomes \N, and tabs, newlines,
+// carriage returns and backslashes are escaped. Use CopyInWithOptions for CSV.
 func CopyIn(tx *sql.Tx, table string, columns ...string) (*CopyInStatement, error) {
+	return CopyInWithOptions(tx, table, CopyInOptions{}, columns...)
+}
+
+// CopyInWithOptions is CopyIn for a stream whose representation the caller
+// chooses. With CopyFormatCSV, rows are written as CSV: a nil value becomes the
+// unquoted NULL string, an empty string is quoted so it cannot read as NULL,
+// and a value that holds the delimiter, the quote, a line break or the NULL
+// string is quoted with the statement's quote and escape characters. Header
+// only asks the server to expect a header line; the caller writes that line as
+// its first row, because the COPY protocol carries rows only.
+func CopyInWithOptions(tx *sql.Tx, table string, options CopyInOptions, columns ...string) (*CopyInStatement, error) {
 	if tx == nil {
 		return nil, errors.New("opengauss: CopyIn needs a transaction")
 	}
-	stmt, err := tx.Prepare(copyInSQL(table, columns))
+	normalized, err := checkCopyInOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	stmt, err := tx.Prepare(copyInSQL(table, columns, normalized))
 	if err != nil {
 		return nil, err
 	}
@@ -55,9 +70,9 @@ func (s *CopyInStatement) Close() error {
 	return s.stmt.Close()
 }
 
-// copyInSQL builds the COPY statement with quoted identifiers. A table name
-// with dots is treated as schema-qualified.
-func copyInSQL(table string, columns []string) string {
+// copyInSQL builds the COPY statement with quoted identifiers and the options
+// the encoder writes. A table name with dots is treated as schema-qualified.
+func copyInSQL(table string, columns []string, options CopyInOptions) string {
 	var b strings.Builder
 	b.WriteString("COPY ")
 	for i, part := range strings.Split(table, ".") {
@@ -77,6 +92,28 @@ func copyInSQL(table string, columns []string) string {
 		b.WriteByte(')')
 	}
 	b.WriteString(" FROM STDIN")
+	if options.Format != CopyFormatCSV {
+		return b.String()
+	}
+	// Only options that differ from the CSV defaults are sent, so the server
+	// parses the same representation the encoder writes.
+	b.WriteString(" WITH (FORMAT csv")
+	if options.Delimiter != ',' {
+		b.WriteString(", DELIMITER " + quoteCopyOptionLiteral(string(options.Delimiter)))
+	}
+	if options.Quote != '"' {
+		b.WriteString(", QUOTE " + quoteCopyOptionLiteral(string(options.Quote)))
+	}
+	if options.Escape != options.Quote {
+		b.WriteString(", ESCAPE " + quoteCopyOptionLiteral(string(options.Escape)))
+	}
+	if options.Header {
+		b.WriteString(", HEADER true")
+	}
+	if options.Null != "" {
+		b.WriteString(", NULL " + quoteCopyOptionLiteral(options.Null))
+	}
+	b.WriteByte(')')
 	return b.String()
 }
 
@@ -249,48 +286,13 @@ func copyStreamError(typ byte) error {
 	}
 }
 
-// copyInTailError rejects COPY options, because the row encoder always writes
-// the default text format. A CSV or HEADER stream would be parsed under
-// different rules and silently import wrong values.
-func copyInTailError(statement string, clauseEnd int) error {
-	return copyTailError(statement, clauseEnd,
-		"opengauss: COPY ... FROM STDIN options are not implemented: the driver writes the default text format only")
-}
-
-// copyTailError rejects COPY input options, because only the default text format
-// is implemented for that direction. Whitespace, comments and a trailing
-// separator may follow the clause; anything else is an option the driver does
-// not implement.
-func copyTailError(statement string, clauseEnd int, message string) error {
-	for i := clauseEnd; i < len(statement); {
-		switch {
-		case isSpace(statement[i]), statement[i] == ';':
-			i++
-		case strings.HasPrefix(statement[i:], "--"):
-			newline := strings.IndexAny(statement[i:], "\n\r")
-			if newline < 0 {
-				return nil
-			}
-			i += newline + 1
-		case strings.HasPrefix(statement[i:], "/*"):
-			end := strings.Index(statement[i+2:], "*/")
-			if end < 0 {
-				return nil
-			}
-			i += 2 + end + 2
-		default:
-			return errors.New(message)
-		}
-	}
-	return nil
-}
-
 // copyStmt is a COPY ... FROM STDIN statement. The server is not asked to
 // prepare it: each Exec call sends one CopyData row and the final one sends
 // CopyDone and reads the command result.
 type copyStmt struct {
 	conn      *conn
 	statement string
+	options   CopyInOptions
 	closed    bool
 	finished  bool
 }
@@ -393,6 +395,7 @@ func (c *conn) beginCopyIn(ctx context.Context, owner *copyStmt) error {
 			c.copying = true
 			c.copyOwner = owner
 			c.copyColumns = columns
+			c.copyOptions = owner.options
 			c.copyWatcher = watcher
 			c.copyCtx = ctx
 			return nil
@@ -420,9 +423,10 @@ func (c *conn) beginCopyIn(ctx context.Context, owner *copyStmt) error {
 	}
 }
 
-// writeCopyRow sends one text-format row. A row that cannot be encoded, has the
-// wrong width or belongs to an ended context ends the stream with CopyFail, so
-// the server aborts the COPY instead of importing the rows already sent.
+// writeCopyRow sends one row in the representation the statement selected. A
+// row that cannot be encoded, has the wrong width or belongs to an ended
+// context ends the stream with CopyFail, so the server aborts the COPY instead
+// of importing the rows already sent.
 func (c *conn) writeCopyRow(ctx context.Context, args []driver.NamedValue) error {
 	if !c.copying {
 		return errors.New("opengauss: the COPY stream is not open")
@@ -436,7 +440,7 @@ func (c *conn) writeCopyRow(ctx context.Context, args []driver.NamedValue) error
 		c.abortCopyIn(err)
 		return err
 	}
-	line, err := encodeCopyRow(c.copyRowBuf[:0], args)
+	line, err := encodeCopyRow(c.copyRowBuf[:0], args, c.copyOptions)
 	if err != nil {
 		c.copyRowBuf = nil
 		c.abortCopyIn(err)
@@ -595,9 +599,18 @@ func parseCopyResponse(body []byte) (format byte, columns int, err error) {
 	return format, count, nil
 }
 
-// encodeCopyRow renders one row: values separated by tabs, terminated by a
-// newline, with \N for NULL and the COPY text escapes for control characters.
-func encodeCopyRow(dest []byte, args []driver.NamedValue) ([]byte, error) {
+// encodeCopyRow renders one row in the representation the statement selected.
+func encodeCopyRow(dest []byte, args []driver.NamedValue, options CopyInOptions) ([]byte, error) {
+	if options.Format == CopyFormatCSV {
+		return encodeCopyCSVRow(dest, args, options)
+	}
+	return encodeCopyTextRow(dest, args)
+}
+
+// encodeCopyTextRow renders one row of the default text format: values
+// separated by tabs, terminated by a newline, with \N for NULL and the COPY text
+// escapes for control characters.
+func encodeCopyTextRow(dest []byte, args []driver.NamedValue) ([]byte, error) {
 	for i, arg := range args {
 		if i > 0 {
 			dest = append(dest, '\t')
@@ -613,6 +626,52 @@ func encodeCopyRow(dest []byte, args []driver.NamedValue) ([]byte, error) {
 		dest = appendCopyEscaped(dest, text)
 	}
 	return append(dest, '\n'), nil
+}
+
+// encodeCopyCSVRow renders one CSV row. NULL is the unquoted NULL string; a
+// value is quoted when it would otherwise read as NULL or lose a separator,
+// quote or line break.
+func encodeCopyCSVRow(dest []byte, args []driver.NamedValue, options CopyInOptions) ([]byte, error) {
+	for i, arg := range args {
+		if i > 0 {
+			dest = append(dest, options.Delimiter)
+		}
+		if arg.Value == nil {
+			dest = append(dest, options.Null...)
+			continue
+		}
+		text, err := encodeTextValue(arg.Value)
+		if err != nil {
+			return nil, fmt.Errorf("opengauss: COPY column %d: %w", i+1, err)
+		}
+		dest = appendCopyCSVField(dest, text, options)
+	}
+	return append(dest, '\n'), nil
+}
+
+// appendCopyCSVField writes one CSV field, quoting it when the text is empty,
+// equals the NULL string or carries a separator, the quote or a line break.
+// Inside quotes the quote and the escape character are preceded by the escape
+// character, which is the doubled quote by default.
+func appendCopyCSVField(dest, text []byte, options CopyInOptions) []byte {
+	quote := len(text) == 0 ||
+		bytes.Equal(text, []byte(options.Null)) ||
+		bytes.IndexByte(text, options.Delimiter) >= 0 ||
+		bytes.IndexByte(text, options.Quote) >= 0 ||
+		bytes.IndexByte(text, '\n') >= 0 ||
+		bytes.IndexByte(text, '\r') >= 0
+	if !quote {
+		return append(dest, text...)
+	}
+	dest = append(dest, options.Quote)
+	for _, b := range text {
+		if b == options.Quote || b == options.Escape {
+			dest = append(dest, options.Escape, b)
+			continue
+		}
+		dest = append(dest, b)
+	}
+	return append(dest, options.Quote)
 }
 
 // appendCopyEscaped writes text with the escapes COPY expects in text format.

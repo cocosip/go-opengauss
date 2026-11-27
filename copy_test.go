@@ -15,16 +15,57 @@ func TestCopyInSQL(t *testing.T) {
 	tests := []struct {
 		table   string
 		columns []string
+		options CopyInOptions
 		want    string
 	}{
-		{"logs", nil, `COPY "logs" FROM STDIN`},
-		{"logs", []string{"id", "msg"}, `COPY "logs" ("id", "msg") FROM STDIN`},
-		{"public.logs", []string{"id"}, `COPY "public"."logs" ("id") FROM STDIN`},
-		{`we"ird`, nil, `COPY "we""ird" FROM STDIN`},
+		{table: "logs", want: `COPY "logs" FROM STDIN`},
+		{table: "logs", columns: []string{"id", "msg"}, want: `COPY "logs" ("id", "msg") FROM STDIN`},
+		{table: "public.logs", columns: []string{"id"}, want: `COPY "public"."logs" ("id") FROM STDIN`},
+		{table: `we"ird`, want: `COPY "we""ird" FROM STDIN`},
+		// CSV always states its format; other options are sent only when they
+		// differ from the CSV defaults the encoder applies.
+		{
+			table: "logs", columns: []string{"id", "msg"},
+			options: CopyInOptions{Format: CopyFormatCSV},
+			want:    `COPY "logs" ("id", "msg") FROM STDIN WITH (FORMAT csv)`,
+		},
+		{
+			table: "logs", options: CopyInOptions{Format: CopyFormatCSV, Header: true},
+			want: `COPY "logs" FROM STDIN WITH (FORMAT csv, HEADER true)`,
+		},
+		{
+			table: "logs",
+			options: CopyInOptions{
+				Format: CopyFormatCSV, Delimiter: '|', Quote: '~', Escape: '\\', Null: "NA",
+			},
+			want: `COPY "logs" FROM STDIN WITH (FORMAT csv, DELIMITER '|', QUOTE '~', ESCAPE E'\\', NULL 'NA')`,
+		},
+		{
+			// A quote character is escaped as a doubled SQL quote.
+			table:   "logs",
+			options: CopyInOptions{Format: CopyFormatCSV, Delimiter: ';', Quote: '\''},
+			want:    `COPY "logs" FROM STDIN WITH (FORMAT csv, DELIMITER ';', QUOTE '''')`,
+		},
 	}
 	for _, tc := range tests {
-		if got := copyInSQL(tc.table, tc.columns); got != tc.want {
-			t.Errorf("copyInSQL(%q, %v) = %q, want %q", tc.table, tc.columns, got, tc.want)
+		options, err := checkCopyInOptions(tc.options)
+		if err != nil {
+			t.Fatalf("checkCopyInOptions(%#v) = %v", tc.options, err)
+		}
+		if got := copyInSQL(tc.table, tc.columns, options); got != tc.want {
+			t.Errorf("copyInSQL(%q, %v, %#v) = %q, want %q", tc.table, tc.columns, tc.options, got, tc.want)
+		}
+		// The encoder must read the statement back as the same options.
+		kind, clauseEnd := copyDirection(copyInSQL(tc.table, tc.columns, options))
+		if kind != copyIn {
+			t.Fatalf("copyDirection(%q) = %v, want copyIn", copyInSQL(tc.table, tc.columns, options), kind)
+		}
+		parsed, err := parseCopyInOptions(copyInSQL(tc.table, tc.columns, options), clauseEnd)
+		if err != nil {
+			t.Fatalf("parseCopyInOptions(%q) = %v", copyInSQL(tc.table, tc.columns, options), err)
+		}
+		if parsed != options {
+			t.Errorf("round trip of %#v produced %#v", options, parsed)
 		}
 	}
 }
@@ -67,7 +108,7 @@ func TestEncodeCopyRow(t *testing.T) {
 		"vertical\vbackspace\bformfeed\f",
 		int64(42),
 		true,
-	}))
+	}), CopyInOptions{})
 	if err != nil {
 		t.Fatalf("encodeCopyRow: %v", err)
 	}
@@ -76,8 +117,102 @@ func TestEncodeCopyRow(t *testing.T) {
 		t.Errorf("row = %q, want %q", row, want)
 	}
 
-	if _, err := encodeCopyRow(nil, namedValues([]driver.Value{struct{}{}})); err == nil {
+	if _, err := encodeCopyRow(nil, namedValues([]driver.Value{struct{}{}}), CopyInOptions{}); err == nil {
 		t.Error("expected an unsupported value type to fail")
+	}
+}
+
+func TestEncodeCopyCSVRow(t *testing.T) {
+	options, err := checkCopyInOptions(CopyInOptions{Format: CopyFormatCSV})
+	if err != nil {
+		t.Fatalf("checkCopyInOptions: %v", err)
+	}
+	row, err := encodeCopyCSVRow(nil, namedValues([]driver.Value{
+		nil,
+		"",
+		"plain",
+		"comma,here",
+		`say "hi"`,
+		"line\nbreak",
+		"carriage\rreturn",
+		int64(42),
+		true,
+	}), options)
+	if err != nil {
+		t.Fatalf("encodeCopyCSVRow: %v", err)
+	}
+	// NULL is the unquoted empty field; an empty string, a separator, a quote
+	// and a line break are quoted, and a quote doubles.
+	want := ",\"\",plain,\"comma,here\",\"say \"\"hi\"\"\",\"line\nbreak\",\"carriage\rreturn\",42,1\n"
+	if string(row) != want {
+		t.Errorf("row = %q, want %q", row, want)
+	}
+
+	custom, err := checkCopyInOptions(CopyInOptions{
+		Format: CopyFormatCSV, Delimiter: '|', Quote: '~', Escape: '\\', Null: "NA",
+	})
+	if err != nil {
+		t.Fatalf("checkCopyInOptions: %v", err)
+	}
+	row, err = encodeCopyCSVRow(nil, namedValues([]driver.Value{
+		nil,
+		"NA",
+		"a|b",
+		"back\\slash",
+		"tilde~here",
+		"pipe",
+	}), custom)
+	if err != nil {
+		t.Fatalf("encodeCopyCSVRow: %v", err)
+	}
+	// A literal value equal to the NULL string is quoted, the quote is escaped
+	// with the escape character, and a lone escape character outside quotes
+	// stays literal because CSV gives it no meaning there.
+	want = "NA|~NA~|~a|b~|back\\slash|~tilde\\~here~|pipe\n"
+	if string(row) != want {
+		t.Errorf("row = %q, want %q", row, want)
+	}
+
+	if _, err := encodeCopyCSVRow(nil, namedValues([]driver.Value{struct{}{}}), options); err == nil {
+		t.Error("expected an unsupported value type to fail")
+	}
+}
+
+func TestCopyInOptionErrors(t *testing.T) {
+	tests := []struct {
+		statement string
+		err       string
+	}{
+		{`COPY "logs" FROM STDIN WITH (FORMAT binary)`, "binary format"},
+		{`COPY "logs" FROM STDIN BINARY`, "binary format"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT xsv)`, "unknown COPY format"},
+		{`COPY "logs" FROM STDIN WITH (ENCODING 'UTF8')`, "ENCODING is not implemented"},
+		{`COPY "logs" FROM STDIN WITH (HEADER)`, "HEADER is available only with FORMAT csv"},
+		{`COPY "logs" FROM STDIN WITH (DELIMITER '|')`, "DELIMITER is available only with FORMAT csv"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, DELIMITER '||')`, "one single-byte character"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, DELIMITER ';', QUOTE ';')`, "must differ"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, HEADER maybe)`, "is not a boolean"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv, HEADER); SELECT 1`, "only statement"},
+		{`COPY "logs" FROM STDIN WITH (FORMAT csv`, "not closed"},
+	}
+	for _, test := range tests {
+		kind, clauseEnd := copyDirection(test.statement)
+		if kind != copyIn {
+			t.Fatalf("copyDirection(%q) = %v, want copyIn", test.statement, kind)
+		}
+		if _, err := parseCopyInOptions(test.statement, clauseEnd); err == nil ||
+			!strings.Contains(err.Error(), test.err) {
+			t.Errorf("parseCopyInOptions(%q) = %v, want %q", test.statement, err, test.err)
+		}
+	}
+	// The zero options are the default text format.
+	options, err := parseCopyInOptions(`COPY "logs" FROM STDIN`, len(`COPY "logs" FROM STDIN`))
+	if err != nil {
+		t.Fatalf("parseCopyInOptions: %v", err)
+	}
+	want := CopyInOptions{Format: CopyFormatText}
+	if options != want {
+		t.Errorf("options = %#v, want %#v", options, want)
 	}
 }
 
@@ -464,7 +599,7 @@ func TestExecRejectsCopyFromStdin(t *testing.T) {
 	}
 }
 
-func TestCopyInRejectsUnsupportedOptions(t *testing.T) {
+func TestCopyInRejectsUnimplementedOptions(t *testing.T) {
 	server := newFakeServer(t, func(s *fakeSession) {
 		s.completeStartup(nil)
 		s.expectSimpleQuery()
@@ -487,14 +622,17 @@ func TestCopyInRejectsUnsupportedOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
-	for _, statement := range []string{
-		`COPY "logs" FROM STDIN WITH (FORMAT csv)`,
-		`COPY "logs" FROM STDIN (DELIMITER '|')`,
-		`COPY "logs" FROM STDIN CSV HEADER`,
+	for _, test := range []struct {
+		statement string
+		err       string
+	}{
+		{`COPY "logs" FROM STDIN WITH (FORMAT binary)`, "binary format"},
+		{`COPY "logs" FROM STDIN WITH (ENCODING 'UTF8')`, "ENCODING is not implemented"},
+		{`COPY "logs" FROM STDIN WITH (HEADER)`, "HEADER is available only with FORMAT csv"},
 	} {
-		if _, err := tx.PrepareContext(ctx, statement); err == nil ||
-			!strings.Contains(err.Error(), "options are not implemented") {
-			t.Fatalf("Prepare(%q) = %v, want an unsupported-options error", statement, err)
+		if _, err := tx.PrepareContext(ctx, test.statement); err == nil ||
+			!strings.Contains(err.Error(), test.err) {
+			t.Fatalf("Prepare(%q) = %v, want %q", test.statement, err, test.err)
 		}
 	}
 	// A trailing separator is still the default text format.
@@ -510,6 +648,135 @@ func TestCopyInRejectsUnsupportedOptions(t *testing.T) {
 	}
 	if err := db.PingContext(ctx); err != nil {
 		t.Fatalf("PingContext: %v", err)
+	}
+}
+
+// TestCopyInCSVStreamsRows writes a CSV stream through the helper and checks the
+// statement the driver sent and the rows it produced, including the header row
+// the caller supplies itself.
+func TestCopyInCSVStreamsRows(t *testing.T) {
+	rowsCh := make(chan []string, 1)
+	const copyStatement = `COPY "logs" ("id", "msg") FROM STDIN WITH (FORMAT csv, HEADER true)`
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		if query := s.expectSimpleQuery(); query != "BEGIN" {
+			s.fail("begin query = %q", query)
+		}
+		s.sendCommandComplete("BEGIN")
+		s.sendReady(proto.TxnInTransaction)
+
+		if query := s.expectSimpleQuery(); query != copyStatement {
+			s.fail("copy query = %q, want %q", query, copyStatement)
+		}
+		s.sendCopyInResponse(0, 2)
+		rowsCh <- s.readCopyRows()
+		s.sendCommandComplete("COPY 3")
+		s.sendReady(proto.TxnInTransaction)
+
+		if query := s.expectSimpleQuery(); query != "COMMIT" {
+			s.fail("commit query = %q", query)
+		}
+		s.sendCommandComplete("COMMIT")
+		s.sendReady(proto.TxnIdle)
+
+		s.expectPing()
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	copyIn, err := CopyInWithOptions(tx, "logs", CopyInOptions{Format: CopyFormatCSV, Header: true}, "id", "msg")
+	if err != nil {
+		t.Fatalf("CopyInWithOptions: %v", err)
+	}
+	// The caller writes the header line the statement announced.
+	rows := [][]any{
+		{"id", "msg"},
+		{int64(1), `a,b "quoted"`},
+		{int64(2), nil},
+		{int64(3), ""},
+	}
+	for i, row := range rows {
+		if err := copyIn.Exec(row...); err != nil {
+			t.Fatalf("Exec row %d: %v", i+1, err)
+		}
+	}
+	if err := copyIn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext: %v", err)
+	}
+
+	want := []string{
+		"id,msg\n",
+		"1,\"a,b \"\"quoted\"\"\"\n",
+		"2,\n",
+		"3,\"\"\n",
+	}
+	if got := <-rowsCh; !reflect.DeepEqual(got, want) {
+		t.Errorf("rows = %q, want %q", got, want)
+	}
+	if server.connections() != 1 {
+		t.Errorf("connections = %d, want the stream to reuse one session", server.connections())
+	}
+}
+
+// TestCopyInCSVFromStatement proves a hand-written CSV COPY statement decodes its
+// own options, so a caller is not limited to the helper.
+func TestCopyInCSVFromStatement(t *testing.T) {
+	rowsCh := make(chan []string, 1)
+	const copyStatement = `COPY "logs" FROM STDIN WITH (FORMAT csv, DELIMITER '|', NULL 'NA')`
+	server := newFakeServer(t, func(s *fakeSession) {
+		s.completeStartup(nil)
+		s.expectSimpleQuery()
+		s.sendCommandComplete("BEGIN")
+		s.sendReady(proto.TxnInTransaction)
+
+		if query := s.expectSimpleQuery(); query != copyStatement {
+			s.fail("copy query = %q, want %q", query, copyStatement)
+		}
+		s.sendCopyInResponse(0, 2)
+		rowsCh <- s.readCopyRows()
+		s.sendCommandComplete("COPY 1")
+		s.sendReady(proto.TxnInTransaction)
+
+		s.expectSimpleQuery()
+		s.sendCommandComplete("ROLLBACK")
+		s.sendReady(proto.TxnIdle)
+		s.expectType(proto.MsgTerminate)
+	})
+
+	db := openTestDB(t, testDSN(server, ""))
+	ctx := testContext(t)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	statement, err := tx.PrepareContext(ctx, copyStatement)
+	if err != nil {
+		t.Fatalf("PrepareContext: %v", err)
+	}
+	if _, err := statement.Exec(nil, "a|b"); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if err := statement.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	want := []string{"NA|\"a|b\"\n"}
+	if got := <-rowsCh; !reflect.DeepEqual(got, want) {
+		t.Errorf("rows = %q, want %q", got, want)
 	}
 }
 

@@ -67,7 +67,7 @@ func FuzzCopyDirection(f *testing.F) {
 			t.Fatalf("copyDirection(%q) = none with clause end %d", statement, clauseEnd)
 		}
 		if kind != copyNone {
-			_ = copyInTailError(statement, clauseEnd)
+			_, _ = parseCopyInOptions(statement, clauseEnd)
 			_, _ = parseCopyOutOptions(statement, clauseEnd)
 		}
 	})

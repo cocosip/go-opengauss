@@ -41,6 +41,39 @@ func (f *copyOutFormat) useCSVDefaults() {
 // driver never requests and cannot decode.
 var errCopyOutBinary = errors.New("opengauss: COPY ... TO STDOUT uses binary format, which this driver does not support; request FORMAT text or FORMAT csv")
 
+// errCopyInBinary is reported when a COPY ... FROM STDIN statement asks for a
+// binary stream, whose row encoding the driver does not implement.
+var errCopyInBinary = errors.New("opengauss: COPY ... FROM STDIN uses binary format, which this driver does not support; use FORMAT text or FORMAT csv")
+
+// CopyFormat is the representation of a COPY stream.
+type CopyFormat int
+
+const (
+	// CopyFormatText is the default COPY text format: tab-separated fields and
+	// \N for NULL.
+	CopyFormatText CopyFormat = iota
+	// CopyFormatCSV is the CSV format: comma-separated fields, a double quote
+	// for quoting and an unquoted empty field for NULL by default.
+	CopyFormatCSV
+)
+
+// CopyInOptions selects the representation of a COPY ... FROM STDIN stream.
+// The zero value is the default text format, so CopyIn needs no options.
+//
+// For CopyFormatCSV a zero Delimiter or Quote means the CSV default (a comma
+// and a double quote), a zero Escape follows Quote, and an empty Null means
+// NULL is the unquoted empty field. Header asks the server to expect a header
+// line; the caller still writes that line as its first row, because the COPY
+// protocol carries rows only.
+type CopyInOptions struct {
+	Format    CopyFormat
+	Header    bool
+	Delimiter byte
+	Quote     byte
+	Escape    byte
+	Null      string
+}
+
 // copyOption is one name/value pair from a COPY option list.
 type copyOption struct {
 	name     string
@@ -196,29 +229,18 @@ func isCopyOptionNameByte(c byte) bool {
 }
 
 // readCopyOptionValue reads a quoted string or an unquoted word. A quoted value
-// uses the standard SQL rule that a doubled quote stands for one quote.
+// uses the standard SQL rule that a doubled quote stands for one quote, and an
+// E” string additionally expands the backslash escapes the driver emits for a
+// control character or a quote.
 func readCopyOptionValue(statement string, i int) (string, int, error) {
 	if i >= len(statement) {
 		return "", i, errors.New("a value is missing")
 	}
 	if statement[i] == '\'' {
-		var value strings.Builder
-		for j := i + 1; ; {
-			if j >= len(statement) {
-				return "", j, errors.New("the quoted value is not terminated")
-			}
-			if statement[j] != '\'' {
-				value.WriteByte(statement[j])
-				j++
-				continue
-			}
-			if j+1 < len(statement) && statement[j+1] == '\'' {
-				value.WriteByte('\'')
-				j += 2
-				continue
-			}
-			return value.String(), j + 1, nil
-		}
+		return readCopyQuotedValue(statement, i+1, false)
+	}
+	if (statement[i] == 'E' || statement[i] == 'e') && i+1 < len(statement) && statement[i+1] == '\'' {
+		return readCopyQuotedValue(statement, i+2, true)
 	}
 	start := i
 	for i < len(statement) {
@@ -232,6 +254,51 @@ func readCopyOptionValue(statement string, i int) (string, int, error) {
 		return "", i, errors.New("a value is missing")
 	}
 	return statement[start:i], i, nil
+}
+
+// readCopyQuotedValue reads the body of a quoted option value starting just
+// after its opening quote, with escape reporting whether backslash escapes
+// apply.
+func readCopyQuotedValue(statement string, i int, escape bool) (string, int, error) {
+	var value strings.Builder
+	for {
+		if i >= len(statement) {
+			return "", i, errors.New("the quoted value is not terminated")
+		}
+		if statement[i] == '\'' {
+			if i+1 < len(statement) && statement[i+1] == '\'' {
+				value.WriteByte('\'')
+				i += 2
+				continue
+			}
+			return value.String(), i + 1, nil
+		}
+		if escape && statement[i] == '\\' && i+1 < len(statement) {
+			value.WriteByte(unescapeCopyOptionByte(statement[i+1]))
+			i += 2
+			continue
+		}
+		value.WriteByte(statement[i])
+		i++
+	}
+}
+
+// unescapeCopyOptionByte maps the backslash escapes an E” value can carry. Any
+// other escaped character stands for itself.
+func unescapeCopyOptionByte(c byte) byte {
+	switch c {
+	case 'n':
+		return '\n'
+	case 'r':
+		return '\r'
+	case 't':
+		return '\t'
+	case 'b':
+		return '\b'
+	case 'f':
+		return '\f'
+	}
+	return c
 }
 
 // readCopyBoolValue reads a boolean option value when one is present.
@@ -267,33 +334,54 @@ func parseCopyBool(value string) (bool, error) {
 	return false, fmt.Errorf("opengauss: %q is not a boolean", value)
 }
 
+// copyOptionFormat reports whether the option list selects CSV. The legacy CSV
+// and BINARY words are format synonyms, and a binary stream is refused with the
+// message of the direction being parsed.
+func copyOptionFormat(options []copyOption, direction copyKind) (bool, error) {
+	csv := false
+	for _, option := range options {
+		switch option.name {
+		case "format":
+			if !option.hasValue {
+				return false, errors.New("opengauss: COPY option FORMAT needs a value")
+			}
+			switch strings.ToLower(option.value) {
+			case "csv":
+				csv = true
+			case "text":
+			case "binary":
+				return false, copyBinaryError(direction)
+			default:
+				return false, fmt.Errorf("opengauss: unknown COPY format %q: use text or csv", option.value)
+			}
+		case "csv":
+			csv = true
+		case "binary":
+			return false, copyBinaryError(direction)
+		}
+	}
+	return csv, nil
+}
+
+// copyBinaryError names the direction a binary stream would run in.
+func copyBinaryError(direction copyKind) error {
+	if direction == copyIn {
+		return errCopyInBinary
+	}
+	return errCopyOutBinary
+}
+
 // applyCopyOutOptions turns the parsed options into a decoder format. FORMAT is
 // applied first so the other options see the right defaults, and then every
 // option is checked against what the decoder actually implements.
 func applyCopyOutOptions(options []copyOption) (copyOutFormat, error) {
 	format := textCopyOutFormat()
-	// The format comes first so the other options see the right defaults; the
-	// legacy CSV and BINARY words are format synonyms.
-	for _, option := range options {
-		switch option.name {
-		case "format":
-			if !option.hasValue {
-				return copyOutFormat{}, errors.New("opengauss: COPY option FORMAT needs a value")
-			}
-			switch strings.ToLower(option.value) {
-			case "csv":
-				format.useCSVDefaults()
-			case "text":
-			case "binary":
-				return copyOutFormat{}, errCopyOutBinary
-			default:
-				return copyOutFormat{}, fmt.Errorf("opengauss: unknown COPY format %q: use text or csv", option.value)
-			}
-		case "csv":
-			format.useCSVDefaults()
-		case "binary":
-			return copyOutFormat{}, errCopyOutBinary
-		}
+	csv, err := copyOptionFormat(options, copyOut)
+	if err != nil {
+		return copyOutFormat{}, err
+	}
+	if csv {
+		format.useCSVDefaults()
 	}
 	// A single-byte option that does not default to the quote character yet.
 	escapeSet := false
@@ -359,4 +447,120 @@ func singleByteOption(option copyOption) (byte, error) {
 		return 0, fmt.Errorf("opengauss: COPY option %s must be one single-byte character, got %q", strings.ToUpper(option.name), option.value)
 	}
 	return option.value[0], nil
+}
+
+// parseCopyInOptions reads the option list of a COPY ... FROM STDIN statement
+// and returns the representation its rows must be written in. A statement
+// without options keeps the default text format.
+func parseCopyInOptions(statement string, clauseEnd int) (CopyInOptions, error) {
+	options, err := parseCopyOptions(statement, clauseEnd)
+	if err != nil {
+		return CopyInOptions{}, err
+	}
+	return applyCopyInOptions(options)
+}
+
+// applyCopyInOptions turns the parsed options into the representation the row
+// encoder must write.
+func applyCopyInOptions(options []copyOption) (CopyInOptions, error) {
+	csv, err := copyOptionFormat(options, copyIn)
+	if err != nil {
+		return CopyInOptions{}, err
+	}
+	result := CopyInOptions{Format: CopyFormatText}
+	if csv {
+		result.Format = CopyFormatCSV
+	}
+	for _, option := range options {
+		switch option.name {
+		case "format", "csv", "binary":
+			// Already applied.
+		case "header":
+			value := true
+			if option.hasValue {
+				parsed, err := parseCopyBool(option.value)
+				if err != nil {
+					return CopyInOptions{}, err
+				}
+				value = parsed
+			}
+			if !csv {
+				return CopyInOptions{}, errors.New("opengauss: COPY option HEADER is available only with FORMAT csv")
+			}
+			result.Header = value
+		case "delimiter", "quote", "escape":
+			value, err := singleByteOption(option)
+			if err != nil {
+				return CopyInOptions{}, err
+			}
+			if !csv {
+				return CopyInOptions{}, fmt.Errorf("opengauss: COPY option %s is available only with FORMAT csv", strings.ToUpper(option.name))
+			}
+			switch option.name {
+			case "delimiter":
+				result.Delimiter = value
+			case "quote":
+				result.Quote = value
+			case "escape":
+				result.Escape = value
+			}
+		case "null":
+			if !csv {
+				return CopyInOptions{}, errors.New("opengauss: COPY option NULL is available only with FORMAT csv")
+			}
+			if !option.hasValue {
+				return CopyInOptions{}, errors.New("opengauss: COPY option NULL needs a value")
+			}
+			result.Null = option.value
+		default:
+			return CopyInOptions{}, fmt.Errorf("opengauss: COPY option %s is not implemented", strings.ToUpper(option.name))
+		}
+	}
+	return checkCopyInOptions(result)
+}
+
+// checkCopyInOptions fills the CSV defaults and rejects a combination the row
+// encoder cannot write.
+func checkCopyInOptions(options CopyInOptions) (CopyInOptions, error) {
+	switch options.Format {
+	case CopyFormatText:
+		if options.Header || options.Delimiter != 0 || options.Quote != 0 ||
+			options.Escape != 0 || options.Null != "" {
+			return CopyInOptions{}, errors.New("opengauss: DELIMITER, QUOTE, ESCAPE, NULL and HEADER are available only with CopyFormatCSV")
+		}
+		return options, nil
+	case CopyFormatCSV:
+	default:
+		return CopyInOptions{}, fmt.Errorf("opengauss: unknown COPY format %d", int(options.Format))
+	}
+	if options.Delimiter == 0 {
+		options.Delimiter = ','
+	}
+	if options.Quote == 0 {
+		options.Quote = '"'
+	}
+	if options.Escape == 0 {
+		options.Escape = options.Quote
+	}
+	if options.Delimiter == options.Quote {
+		return CopyInOptions{}, fmt.Errorf("opengauss: the COPY delimiter %q and quote %q must differ", options.Delimiter, options.Quote)
+	}
+	for _, c := range []byte{options.Delimiter, options.Quote, options.Escape} {
+		if c == '\n' || c == '\r' {
+			return CopyInOptions{}, errors.New("opengauss: a COPY delimiter, quote or escape cannot be a line break")
+		}
+	}
+	return options, nil
+}
+
+// quoteCopyOptionLiteral writes a COPY option value as a SQL string literal. A
+// value with a backslash switches to the E” form, so it keeps its meaning
+// whatever standard_conforming_strings is set to.
+func quoteCopyOptionLiteral(text string) string {
+	if strings.Contains(text, `\`) {
+		escaped := strings.ReplaceAll(text, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, "'", "''")
+		return "E'" + escaped + "'"
+	}
+	return "'" + strings.ReplaceAll(text, "'", "''") + "'"
 }

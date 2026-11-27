@@ -342,6 +342,84 @@ func TestLiveCopyOut(t *testing.T) {
 	if count != 3 {
 		t.Errorf("count = %d, want 3", count)
 	}
+
+	// CSV output: the header line is skipped, NULL is an empty unquoted field,
+	// and a separator and a quote are quoted with a doubled quote.
+	if _, err := db.ExecContext(ctx, "INSERT INTO "+table+" (id, label) VALUES (4, 'comma, \"quote\"')"); err != nil {
+		t.Fatalf("INSERT for CSV: %v", err)
+	}
+	rows, err = db.QueryContext(ctx, "COPY "+table+" TO STDOUT WITH (FORMAT csv, HEADER)")
+	if err != nil {
+		t.Fatalf("COPY TO STDOUT csv: %v", err)
+	}
+	var csvRows [][]any
+	for rows.Next() {
+		var id, label any
+		if err := rows.Scan(&id, &label); err != nil {
+			t.Fatalf("Scan CSV: %v", err)
+		}
+		csvRows = append(csvRows, []any{id, label})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err CSV: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close CSV: %v", err)
+	}
+	wantCSV := [][]any{{"1", "one"}, {"2", nil}, {"3", "tab\there"}, {"4", `comma, "quote"`}}
+	if !reflect.DeepEqual(csvRows, wantCSV) {
+		t.Fatalf("CSV rows = %#v, want %#v", csvRows, wantCSV)
+	}
+
+	// CSV input: the same quoting is written back through CopyInWithOptions.
+	csvTable := table + "_in"
+	if _, err := db.ExecContext(ctx, "CREATE TABLE "+csvTable+" (id integer, label text)"); err != nil {
+		t.Fatalf("CREATE TABLE for CSV input: %v", err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+csvTable)
+	}()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	copyIn, err := CopyInWithOptions(tx, csvTable, CopyInOptions{Format: CopyFormatCSV}, "id", "label")
+	if err != nil {
+		t.Fatalf("CopyInWithOptions: %v", err)
+	}
+	wantIn := [][]any{{int64(1), "one"}, {int64(2), nil}, {int64(3), "line\nbreak"}, {int64(4), `comma, "quote"`}}
+	for i, row := range wantIn {
+		if err := copyIn.Exec(row...); err != nil {
+			t.Fatalf("CSV Exec row %d: %v", i+1, err)
+		}
+	}
+	if err := copyIn.Close(); err != nil {
+		t.Fatalf("CSV Close: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("CSV Commit: %v", err)
+	}
+	var gotIn []any
+	rows, err = db.QueryContext(ctx, "SELECT label FROM "+csvTable+" ORDER BY id")
+	if err != nil {
+		t.Fatalf("SELECT after CSV input: %v", err)
+	}
+	for rows.Next() {
+		var label any
+		if err := rows.Scan(&label); err != nil {
+			t.Fatalf("Scan after CSV input: %v", err)
+		}
+		gotIn = append(gotIn, label)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close after CSV input: %v", err)
+	}
+	wantLabels := []any{"one", nil, "line\nbreak", `comma, "quote"`}
+	if !reflect.DeepEqual(gotIn, wantLabels) {
+		t.Fatalf("labels = %#v, want %#v", gotIn, wantLabels)
+	}
 }
 
 // TestLiveEncodings verifies the UTF-8 client contract and a non-ASCII round

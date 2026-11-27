@@ -43,13 +43,14 @@ func (c *conn) PrepareContext(ctx context.Context, statement string) (driver.Stm
 		if c.txnStatus != proto.TxnInTransaction {
 			return nil, errors.New("opengauss: COPY ... FROM STDIN must run inside a transaction: use CopyIn(tx, ...)")
 		}
-		if err := copyInTailError(statement, clauseEnd); err != nil {
+		options, err := parseCopyInOptions(statement, clauseEnd)
+		if err != nil {
 			return nil, err
 		}
 		if c.copying {
 			return nil, errors.New("opengauss: a COPY stream is already open on this session")
 		}
-		return &copyStmt{conn: c, statement: statement}, nil
+		return &copyStmt{conn: c, statement: statement, options: options}, nil
 	}
 
 	watcher, err := c.beginOperation(ctx)
