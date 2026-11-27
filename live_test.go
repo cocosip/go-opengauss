@@ -10,9 +10,24 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// liveTableName returns a table name that no other run can already own. The
+// process id alone repeats across runs, so the counter and the start time make
+// the name unique and a leftover table cannot disturb a fresh run.
+func liveTableName(prefix string) string {
+	return fmt.Sprintf("%s_%d_%d_%d", prefix, os.Getpid(), liveTableSeq.Add(1), liveRunStamp)
+}
+
+// liveRunStamp identifies this process, so a name from an earlier run is never
+// mistaken for one of this run's tables.
+var liveRunStamp = time.Now().UnixNano() % 1_000_000
+
+// liveTableSeq numbers the tables a single run creates.
+var liveTableSeq atomic.Int32
 
 // TestLiveFirstMilestone runs the first-milestone acceptance steps against a
 // real openGauss server. It is skipped unless OPENGAUSS_DSN is set, because a
@@ -226,7 +241,7 @@ func TestLiveMultiVectorSearch(t *testing.T) {
 
 	// The table is permanent because each worker searches on its own session
 	// and temporary tables are visible only to their creator.
-	table := fmt.Sprintf("opengauss_live_vector_%d", os.Getpid())
+	table := liveTableName("opengauss_live_vector")
 	if _, err := db.ExecContext(ctx, "CREATE TABLE "+table+" (id integer, embedding vector(3))"); err != nil {
 		t.Skipf("the server does not provide the vector type: %v", err)
 	}
@@ -284,7 +299,7 @@ func TestLiveCopyOut(t *testing.T) {
 	db := sql.OpenDB(connector)
 	defer func() { _ = db.Close() }()
 
-	table := fmt.Sprintf("opengauss_live_copy_out_%d", os.Getpid())
+	table := liveTableName("opengauss_live_copy_out")
 	if _, err := db.ExecContext(ctx, "CREATE TABLE "+table+" (id integer, label text)"); err != nil {
 		t.Skipf("cannot create a table: %v", err)
 	}
@@ -588,8 +603,8 @@ func TestLiveOfficialExamples(t *testing.T) {
 	defer cleanupCancel()
 
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
-	table := "customer_t1_" + suffix
-	jsonTable := "t_jsonb_" + suffix
+	table := liveTableName("customer_t1")
+	jsonTable := liveTableName("t_jsonb")
 	funcName := "testproc_" + suffix
 	insertSQL := "INSERT INTO " + table + " (c_customer_sk, c_customer_name) VALUES ($1, $2)"
 
@@ -744,5 +759,317 @@ func TestLiveOfficialExamples(t *testing.T) {
 	}
 	if id != 2 {
 		t.Errorf("returned id = %d, want 2", id)
+	}
+}
+
+// TestLiveTypes runs the F05 acceptance steps against a real server: text-mode
+// decoding and ColumnTypes for the types the driver decodes, plus the container
+// types it keeps as text. A dolphin-compatible B database changes some of the
+// type rules, so those cases are asserted only where the server reports that
+// compatibility mode.
+func TestLiveTypes(t *testing.T) {
+	dsn := os.Getenv("OPENGAUSS_DSN")
+	if dsn == "" {
+		t.Skip("set OPENGAUSS_DSN to run against a live openGauss server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	defer func() { _ = db.Close() }()
+
+	var compatibility string
+	if err := db.QueryRowContext(ctx, "SHOW sql_compatibility").Scan(&compatibility); err != nil {
+		t.Fatalf("SHOW sql_compatibility: %v", err)
+	}
+	t.Logf("sql_compatibility = %s", compatibility)
+
+	// checkOne reads one column and compares the value with reflect.DeepEqual,
+	// so a nil want asserts NULL and a []byte want asserts exact bytes.
+	checkOne := func(t *testing.T, query, wantType string, want any) {
+		t.Helper()
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		defer func() { _ = rows.Close() }()
+		types, err := rows.ColumnTypes()
+		if err != nil {
+			t.Fatalf("ColumnTypes: %v", err)
+		}
+		if len(types) != 1 {
+			t.Fatalf("%d columns, want 1", len(types))
+		}
+		if got := types[0].DatabaseTypeName(); !strings.EqualFold(got, wantType) {
+			t.Errorf("DatabaseTypeName = %q, want %q", got, wantType)
+		}
+		if !rows.Next() {
+			t.Fatalf("no row: %v", rows.Err())
+		}
+		var got any
+		if err := rows.Scan(&got); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("value = %#v (%T), want %#v (%T)", got, got, want, want)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("Rows.Err: %v", err)
+		}
+	}
+
+	t.Run("scalars", func(t *testing.T) {
+		checkOne(t, "SELECT true", "bool", true)
+		checkOne(t, "SELECT false", "bool", false)
+		checkOne(t, "SELECT NULL::bool", "bool", nil)
+		checkOne(t, "SELECT 32767::int2", "int2", int64(32767))
+		checkOne(t, "SELECT (-2147483648)::int4", "int4", int64(-2147483648))
+		checkOne(t, "SELECT 9223372036854775807::int8", "int8", int64(9223372036854775807))
+		checkOne(t, "SELECT 0.5::float4", "float4", 0.5)
+		checkOne(t, "SELECT (-1.25)::float8", "float8", -1.25)
+		checkOne(t, "SELECT 'plain'::text", "text", "plain")
+		checkOne(t, "SELECT ''::text", "text", "")
+		checkOne(t, "SELECT 'v'::varchar(10)", "varchar", "v")
+		checkOne(t, "SELECT 'c'::\"char\"", "char", "c")
+		checkOne(t, "SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid",
+			"uuid", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+		checkOne(t, `SELECT '\x00ff80'::bytea`, "bytea", []byte{0x00, 0xff, 0x80})
+		checkOne(t, "SELECT ''::bytea", "bytea", []byte{})
+		checkOne(t, "SELECT B'1010'", "bit", "1010")
+		checkOne(t, "SELECT '1 day 02:03:04'::interval", "interval", "1 day 02:03:04")
+		// Numeric keeps every digit as text, so no precision is lost to a float.
+		checkOne(t, "SELECT CAST(123456789012345678901234567890 AS numeric(38,0))",
+			"numeric", "123456789012345678901234567890")
+		checkOne(t, "SELECT 12.345::numeric(8,3)", "numeric", "12.345")
+		checkOne(t, "SELECT '2024-02-29'::date", "date",
+			time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC))
+		// A timestamp with a fractional precision keeps the fraction; the zone
+		// the server appends is decoded into a fixed offset, which is what the
+		// value below compares against.
+		var zoned any
+		if err := db.QueryRowContext(ctx,
+			"SELECT '2024-02-29 13:14:15.123456'::timestamp(6)").Scan(&zoned); err != nil {
+			t.Fatalf("timestamp(6): %v", err)
+		}
+		stamp, ok := zoned.(time.Time)
+		if !ok {
+			t.Fatalf("timestamp(6) = %#v, want a time.Time", zoned)
+		}
+		if stamp.Year() != 2024 || stamp.Month() != time.February || stamp.Day() != 29 ||
+			stamp.Hour() != 13 || stamp.Minute() != 14 || stamp.Second() != 15 ||
+			stamp.Nanosecond() != 123456000 {
+			t.Errorf("timestamp(6) = %v, want 2024-02-29 13:14:15.123456", stamp)
+		}
+	})
+
+	t.Run("containers stay text", func(t *testing.T) {
+		checkOne(t, "SELECT ARRAY[1,2,3]", "int4[]", "{1,2,3}")
+		checkOne(t, `SELECT ARRAY['a,b','c"d']`, "text[]", `{"a,b","c\"d"}`)
+		checkOne(t, "SELECT ARRAY[[1,2],[3,4]]", "int4[]", "{{1,2},{3,4}}")
+		checkOne(t, "SELECT NULL::int4[]", "int4[]", nil)
+	})
+
+	// ColumnTypes metadata comes from the type modifier in RowDescription, so it
+	// needs real columns: a literal carries no modifier.
+	t.Run("column metadata", func(t *testing.T) {
+		pinned, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("db.Conn: %v", err)
+		}
+		defer func() { _ = pinned.Close() }()
+		if _, err := pinned.ExecContext(ctx, `CREATE TEMPORARY TABLE opengauss_live_types (
+			v10 varchar(10),
+			c5 char(5),
+			b4 bit(4),
+			n83 numeric(8,3),
+			stamp timestamptz
+		)`); err != nil {
+			t.Skipf("cannot create a temporary table: %v", err)
+		}
+		rows, err := pinned.QueryContext(ctx,
+			"SELECT v10, c5, b4, n83, stamp FROM opengauss_live_types")
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		defer func() { _ = rows.Close() }()
+		types, err := rows.ColumnTypes()
+		if err != nil {
+			t.Fatalf("ColumnTypes: %v", err)
+		}
+		for _, c := range []struct {
+			name      string
+			wantType  string
+			length    int64
+			lengthOK  bool
+			precision int64
+			scale     int64
+			scaleOK   bool
+		}{
+			{name: "v10", wantType: "varchar", length: 10, lengthOK: true},
+			{name: "c5", wantType: "bpchar", length: 5, lengthOK: true},
+			{name: "b4", wantType: "bit", length: 4, lengthOK: true},
+			{name: "n83", wantType: "numeric", precision: 8, scale: 3, scaleOK: true},
+			{name: "stamp", wantType: "timestamptz"},
+		} {
+			column, found := columnByName(types, c.name)
+			if !found {
+				t.Fatalf("column %s is missing", c.name)
+			}
+			if !strings.EqualFold(column.DatabaseTypeName(), c.wantType) {
+				t.Errorf("%s type = %q, want %q", c.name, column.DatabaseTypeName(), c.wantType)
+			}
+			if length, ok := column.Length(); ok != c.lengthOK || length != c.length {
+				t.Errorf("%s Length = %d, ok %v, want %d, %v", c.name, length, ok, c.length, c.lengthOK)
+			}
+			precision, scale, ok := column.DecimalSize()
+			if ok != c.scaleOK || precision != c.precision || scale != c.scale {
+				t.Errorf("%s DecimalSize = %d, %d, %v, want %d, %d, %v",
+					c.name, precision, scale, ok, c.precision, c.scale, c.scaleOK)
+			}
+			// RowDescription carries no nullability, so the driver must report
+			// that it does not know rather than guess.
+			if nullable, ok := column.Nullable(); ok {
+				t.Errorf("%s Nullable = %v, ok %v, want an unknown nullability", c.name, nullable, ok)
+			}
+		}
+	})
+
+	// A B database follows MySQL rules for the spellings it shares, and the
+	// driver must continue to report what the server actually sends.
+	if strings.EqualFold(compatibility, "B") {
+		t.Run("B mode rules", func(t *testing.T) {
+			// The bare numeric is decimal(10,0), so a cast rounds it.
+			checkOne(t, "SELECT 1.5::numeric", "numeric", "2")
+			// The bare timestamp is a timestamptz with zero fractional
+			// precision, so the fraction is dropped.
+			checkOne(t, "SELECT '2024-02-29 13:14:15.123456'::timestamp", "timestamptz",
+				func() any {
+					var got any
+					if err := db.QueryRowContext(ctx,
+						"SELECT '2024-02-29 13:14:15.123456'::timestamp").Scan(&got); err != nil {
+						t.Fatalf("timestamp: %v", err)
+					}
+					return got
+				}())
+			// The character length syntax of the native modes is a syntax error.
+			if _, err := db.ExecContext(ctx, "SELECT 'x'::varchar(7 char)"); err == nil {
+				t.Error("varchar(7 char) was accepted in B mode")
+			}
+		})
+	}
+}
+
+// columnByName returns the column metadata with the given name.
+func columnByName(types []*sql.ColumnType, name string) (*sql.ColumnType, bool) {
+	for _, column := range types {
+		if column.Name() == name {
+			return column, true
+		}
+	}
+	return nil, false
+}
+
+// TestLiveVectorTypes runs the F10 acceptance steps against a real server: the
+// vector column type is named, its text form round-trips, NULL and a missing
+// dimension behave, and a nearest-neighbour order comes back as the distance
+// operator defines it.
+func TestLiveVectorTypes(t *testing.T) {
+	dsn := os.Getenv("OPENGAUSS_DSN")
+	if dsn == "" {
+		t.Skip("set OPENGAUSS_DSN to run against a live openGauss server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	connector, err := NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	defer func() { _ = db.Close() }()
+
+	// One session, so a temporary table is visible to every statement here.
+	pinned, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db.Conn: %v", err)
+	}
+	defer func() { _ = pinned.Close() }()
+
+	if _, err := pinned.ExecContext(ctx, "CREATE TEMPORARY TABLE opengauss_live_vectors (id integer, embedding vector(3))"); err != nil {
+		t.Skipf("the server does not provide the vector type: %v", err)
+	}
+
+	rows, err := pinned.QueryContext(ctx, "SELECT id, embedding FROM opengauss_live_vectors")
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		t.Fatalf("ColumnTypes: %v", err)
+	}
+	if got := types[1].DatabaseTypeName(); !strings.EqualFold(got, "vector") {
+		t.Errorf("vector DatabaseTypeName = %q, want vector", got)
+	}
+	// The driver decodes a vector as its text form, so a scan reports a string.
+	if got := types[1].ScanType(); got == nil || got.Kind().String() != "string" {
+		t.Errorf("vector ScanType = %v, want a string", got)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The text form is what the official guide binds, and it round-trips.
+	for i, value := range []string{"[1,0,0]", "[0,1,0]", "[0,0,1]"} {
+		if _, err := pinned.ExecContext(ctx, "INSERT INTO opengauss_live_vectors (id, embedding) VALUES ($1, $2::vector)", i+1, value); err != nil {
+			t.Fatalf("INSERT vector %q: %v", value, err)
+		}
+	}
+	if _, err := pinned.ExecContext(ctx, "INSERT INTO opengauss_live_vectors (id, embedding) VALUES ($1, NULL)", 4); err != nil {
+		t.Fatalf("INSERT NULL vector: %v", err)
+	}
+	var gotText string
+	if err := pinned.QueryRowContext(ctx, "SELECT embedding::text FROM opengauss_live_vectors WHERE id = 1").Scan(&gotText); err != nil {
+		t.Fatalf("vector as text: %v", err)
+	}
+	if gotText != "[1,0,0]" {
+		t.Errorf("vector text = %q, want [1,0,0]", gotText)
+	}
+	var nullVector *string
+	if err := pinned.QueryRowContext(ctx, "SELECT embedding::text FROM opengauss_live_vectors WHERE id = 4").Scan(&nullVector); err != nil {
+		t.Fatalf("NULL vector: %v", err)
+	}
+	if nullVector != nil {
+		t.Errorf("NULL vector = %q, want NULL", *nullVector)
+	}
+
+	// A vector of the wrong width is rejected by the server, not silently
+	// truncated by the driver.
+	if _, err := pinned.ExecContext(ctx, "INSERT INTO opengauss_live_vectors (id, embedding) VALUES ($1, $2::vector)", 5, "[1,2]"); err == nil {
+		t.Error("a two-dimensional vector was accepted by a vector(3) column")
+	}
+
+	// The distance operator orders the rows, and the nearest one comes first.
+	rows, err = pinned.QueryContext(ctx, "SELECT id FROM opengauss_live_vectors WHERE embedding IS NOT NULL ORDER BY embedding <-> $1::vector LIMIT 2", "[0,1,0]")
+	if err != nil {
+		t.Fatalf("nearest-neighbour query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var nearest []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		nearest = append(nearest, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Rows.Err: %v", err)
+	}
+	if want := []int64{2, 1}; !reflect.DeepEqual(nearest, want) {
+		t.Errorf("nearest ids = %v, want %v", nearest, want)
 	}
 }
